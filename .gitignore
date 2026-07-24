@@ -1,0 +1,49 @@
+# Python virtual environments
+.venv/
+.venv311/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data/log/output directories
+out/
+*.h
+
+# pip cache and temp
+pip-log.txt
+pip-delete-this-directory.txt
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Visual Studio Code
+.vscode/
+
+# Git metadata
+.git/
+
+# TensorFlow/TFLite intermediate files
+*.tflite
+
+# Arduino build artifacts
+build/
+*.elf
+*.bin
+*.hex
+*.map
+*.eep
+*.sym
+
+# Local environment
+.env
+.env.*
+
+# Ignore model bytes header if generated locally
+model_bytes.h
