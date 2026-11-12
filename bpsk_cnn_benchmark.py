@@ -451,6 +451,49 @@ def evaluate_ber(model: nn.Module, loader: DataLoader, device: str) -> float:
     return errors / max(count, 1)
 
 
+def _roc_auc(labels: NDArray[np.bool_], scores: NDArray[np.float64]) -> float:
+    """Compute binary ROC AUC from scores using average ranks for ties."""
+    positive_count = int(labels.sum())
+    negative_count = len(labels) - positive_count
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError("ROC AUC requires at least one sample from each class.")
+
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    ranks = np.empty(len(scores), dtype=np.float64)
+    start = 0
+    while start < len(scores):
+        end = start + 1
+        while end < len(scores) and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        ranks[order[start:end]] = (start + 1 + end) / 2.0
+        start = end
+
+    positive_rank_sum = float(ranks[labels].sum())
+    return (positive_rank_sum - positive_count * (positive_count + 1) / 2.0) / (
+        positive_count * negative_count
+    )
+
+
+@torch.inference_mode()
+def evaluate_classification(
+    model: nn.Module, loader: DataLoader, device: str
+) -> tuple[float, float]:
+    """Return thresholded accuracy and threshold-independent ROC AUC."""
+    model.eval()
+    all_logits: list[NDArray[np.float64]] = []
+    all_labels: list[NDArray[np.bool_]] = []
+    for inputs, labels, _ in loader:
+        logits = _logits(model, inputs.to(device)).squeeze(1)
+        all_logits.append(logits.cpu().numpy().astype(np.float64, copy=False))
+        all_labels.append((labels.squeeze(1).numpy() >= 0.5))
+
+    scores = np.concatenate(all_logits)
+    targets = np.concatenate(all_labels)
+    accuracy = float(np.mean((scores >= 0.0) == targets))
+    return accuracy, _roc_auc(targets, scores)
+
+
 def _loader(
     arrays: tuple[FloatArray, FloatArray, FloatArray],
     batch_size: int,
@@ -560,6 +603,8 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         complexity[name] = {"trainable_parameters": parameter_count}
 
     sweep_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
+    accuracy_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
+    roc_auc_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
     constellation_inputs: FloatArray | None = None
     for snr in config.snr_sweep_db:
         print(f"\nEvaluating SNR {snr} dB...", flush=True)
@@ -568,7 +613,10 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         )
         loader = _loader(arrays, 1024)
         for name, model in models.items():
-            sweep_results[name][str(snr)] = evaluate_ber(model, loader, config.device)
+            accuracy, roc_auc = evaluate_classification(model, loader, config.device)
+            accuracy_results[name][str(snr)] = accuracy
+            sweep_results[name][str(snr)] = 1.0 - accuracy
+            roc_auc_results[name][str(snr)] = roc_auc
         if snr == 12:
             constellation_inputs = arrays[0]
 
@@ -601,6 +649,8 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         "validation_windows": len(validation_arrays[0]),
         "complexity": complexity,
         "ber_vs_snr": sweep_results,
+        "accuracy_vs_snr": accuracy_results,
+        "roc_auc_vs_snr": roc_auc_results,
         "latency_method": "Median of 3 CPU/GPU inference passes, batch size 256, exactly 10,000 windows when available.",
         "figure": "bpsk_cnn_benchmark_results.png",
     }

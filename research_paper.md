@@ -13,12 +13,16 @@ convolutional architectures, and a denoising autoencoder (DAE) with a
 center-symbol classifier. Models are trained on 1,000 bursts and evaluated
 on 200 separate validation bursts and on 150 bursts at each SNR from 0 to
 20 dB in 2 dB increments. The benchmark records measured bit-error rate
-(BER), trainable parameter count, and inference latency per 10,000 windows.
+(BER), thresholded accuracy, ROC area under the curve (AUC), trainable
+parameter count, and inference latency per 10,000 windows.
 In this CPU run, the lowest measured BER was **0.04118** for the denoising
 autoencoder at **20 dB**. Latency ranged from **12.228 ms** to **546.000 ms**
 per 10,000 windows, and model sizes ranged from **641** to **24,449**
-trainable parameters. These results characterize the specified synthetic
-simulation and should not be interpreted as over-the-air performance.
+trainable parameters. Across the 11 SNR points, DenoisingAE1D had the
+highest mean accuracy (**0.89633**) and mean ROC AUC (**0.94717**). At
+20 dB, its accuracy was **0.95882** and ROC AUC was **0.99004**. These
+results characterize the specified synthetic simulation and should not be
+interpreted as over-the-air performance.
 
 ## I. Introduction
 
@@ -160,7 +164,12 @@ All models are optimized with AdamW, learning rate \(10^{-3}\), batch size
 The training set contains 1,000 bursts (51,000 windows); validation contains
 200 separate bursts (10,200 windows). At each SNR point, 150 new bursts
 (7,650 windows) are generated. Models are evaluated by thresholding logits
-at zero and computing the fraction of incorrect center bits. Latency is the
+at zero. Accuracy is the fraction of correct center-bit decisions; BER is
+the fraction of incorrect decisions on the same samples. ROC AUC is
+calculated from raw logits using the rank-sum definition with average ranks
+for tied scores. Detailed accuracy and AUC are recorded at each SNR in
+`benchmark_metrics.json`; the summary table below reports the arithmetic
+mean across SNR points as well as the 12 dB comparison. Latency is the
 median of three inference passes over 10,000 validation windows in batches
 of 256, on the recorded device. Parameter counts include trainable weights
 and biases.
@@ -203,6 +212,23 @@ The right-hand plot compares received center I/Q samples with the
 autoencoder's reconstructed center I/Q samples; it is a qualitative
 visualization and does not replace the BER metric.
 
+### C. Accuracy and ROC-AUC comparison
+
+| Model | Mean accuracy (0–20 dB) | Mean ROC AUC (0–20 dB) | Accuracy at 12 dB | ROC AUC at 12 dB |
+|---|---:|---:|---:|---:|
+| MLPBaseline | 0.78573 | 0.86681 | 0.80810 | 0.89082 |
+| VanillaCNN1D | 0.67327 | 0.74161 | 0.68301 | 0.75478 |
+| ResNet1D | 0.83471 | 0.92294 | 0.87033 | 0.95597 |
+| Inception1D | 0.72696 | 0.82198 | 0.74261 | 0.84001 |
+| DenseNet1D | 0.66827 | 0.73427 | 0.67634 | 0.75012 |
+| DenoisingAE1D | 0.89633 | 0.94717 | 0.94340 | 0.98460 |
+
+DenoisingAE1D ranked first in mean accuracy and mean ROC AUC over the tested
+SNR sweep. At 12 dB, it also had the highest accuracy (0.94340) and AUC
+(0.98460), followed by ResNet1D (0.87033 accuracy, 0.95597 AUC). The
+per-SNR JSON metrics support inspection of the full curves; accuracy equals
+\(1-\mathrm{BER}\) because both use the same binary threshold and samples.
+
 ## V. Discussion
 
 The best result was achieved by the DAE, whose BER decreased from 0.24484 at
@@ -213,6 +239,12 @@ that adding convolutions alone did not guarantee improved equalization under
 the chosen architectures, pooling, training duration, and synthetic channel.
 The DAE's reconstruction objective appears beneficial here, but this single
 seed does not establish that it will generalize better in other settings.
+The ranking metrics support the same comparison: DenoisingAE1D reached
+0.99004 ROC AUC and 0.95882 accuracy at 20 dB, while ResNet1D reached
+0.96266 ROC AUC and 0.88562 accuracy. ROC AUC uses raw logits and is
+threshold-independent, whereas accuracy and BER share the zero-logit
+decision threshold. High AUC with lower accuracy can indicate useful score
+ordering despite imperfect threshold calibration.
 
 The MLP was the smallest and fastest model (641 parameters; 12.228 ms per
 10,000 windows). The ResNet was the largest (24,449 parameters), while

@@ -117,7 +117,7 @@ The full run trains six models, so it can take a while, especially on a CPU.
 The script writes:
 
 - `benchmark_metrics.json` — parameter counts, measured inference latency,
-  configuration, and BER at each SNR;
+  configuration, and BER, accuracy, and ROC AUC at each SNR;
 - `bpsk_cnn_benchmark_results.png` — BER curves and the denoiser's I/Q
   constellation comparison at 12 dB.
 
@@ -129,6 +129,14 @@ Compare CNNs with the MLP to see whether using the 16-symbol context helped.
 If BER levels off, some other modeled distortion may be limiting performance.
 For log-scale plotting, an exactly zero BER is drawn at a small visual floor;
 the exact measured value remains zero in `benchmark_metrics.json`.
+
+The metrics JSON also compares **accuracy** (fraction of correct bit
+decisions at a 0.5 probability threshold) and **ROC AUC** at every SNR.
+Accuracy is the complement of BER on the same samples. ROC AUC evaluates how
+well a model ranks transmitted `1` samples above `0` samples across possible
+decision thresholds; 1.0 is perfect ranking, 0.5 is chance-level ranking.
+Because windows overlap, these are window-level measurements rather than
+independent-burst confidence intervals.
 
 On the **constellation plot**, each point is the center I/Q sample. Before
 denoising, the points are spread and distorted. After denoising, the
@@ -148,11 +156,17 @@ set). The ResNet reached about **0.1144**, and the center-sample MLP about
 beat the MLP in this 20-epoch run, so using a CNN did not automatically
 improve detection.
 
+The denoising autoencoder also ranked best by accuracy (**95.88%**) and
+ROC AUC (**0.9900**) at 20 dB. Across all 11 SNR points, its average
+accuracy was **89.63%** and average ROC AUC was **0.9472**. The JSON file
+contains the accuracy and AUC comparison for each model at every SNR.
+
 The MLP was the smallest and fastest model in this run: **641 parameters**
 and about **12.2 ms per 10,000 windows**. The DAE used **13,061 parameters**
 and about **224.6 ms per 10,000 windows**. These measurements depend on the
 host computer and synthetic setup; the technical table in
-[`research_paper.md`](./research_paper.md) has all measured SNR points.
+[`research_paper.md`](./research_paper.md) summarizes accuracy and ROC AUC
+alongside the BER tables; the JSON includes their values at every SNR.
 
 ## Scope and limitations
 
