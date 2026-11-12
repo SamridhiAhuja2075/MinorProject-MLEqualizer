@@ -1,49 +1,34 @@
 # Python virtual environments
 .venv/
-.venv311/
+.venv*/
 
-# Python cache
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Data/log/output directories
-out/
-*.h
+# Test and coverage output
+.coverage
+.coverage.*
+htmlcov/
 
-# pip cache and temp
-pip-log.txt
-pip-delete-this-directory.txt
-*.log
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Visual Studio Code
-.vscode/
-
-# Git metadata
-.git/
-
-# TensorFlow/TFLite intermediate files
-*.tflite
-
-# Arduino build artifacts
-build/
-*.elf
-*.bin
-*.hex
-*.map
-*.eep
-*.sym
-
-# Local environment
+# Local environment variables and secrets
 .env
 .env.*
+!.env.example
 
-# Ignore model bytes header if generated locally
-model_bytes.h
+# Logs and temporary files
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter and editor-local state
+.ipynb_checkpoints/
+.vscode/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

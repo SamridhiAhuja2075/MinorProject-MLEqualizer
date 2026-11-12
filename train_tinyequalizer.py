@@ -1,319 +1,564 @@
-#!/usr/bin/env python3
-"""
-train_tinyequalizer.py
+r"""
+train_tiny_equalizer.py
+=========================================================================
+Lightweight ML-based BPSK equalizer for deployment on ESP32 (TFLite Micro).
 
-Self-contained PyTorch training pipeline to generate synthetic BPSK data
-with Rayleigh fading and receiver impairments, train a tiny MLP equalizer,
-export to ONNX, convert to TensorFlow SavedModel, and produce a quantized
-INT8 TFLite model ready for edge deployment.
+Pipeline:
+  1. Generate synthetic BPSK data corrupted by:
+       - Rayleigh fading (h)
+       - Phase noise (oscillator jitter)
+       - I/Q gain imbalance
+       - Non-linear receiver clipping (Rapp model)
+       - AWGN (variable SNR)
+  2. Train a tiny MLP (TinyEqualizer) to recover the original bit from
+     the corrupted [I, Q] pair -- jointly learning an implicit inverse
+     of the channel + hardware distortion.
+  3. Evaluate Bit Error Rate (BER).
+  4. Export: PyTorch -> ONNX -> TensorFlow SavedModel -> TFLite (int8).
 
-Outputs (written to ./out/):
- - tiny_equalizer.pt (PyTorch weights)
- - tiny_equalizer.onnx
- - saved_model/ (TensorFlow SavedModel)
- - tiny_equalizer_quant.tflite (INT8 quantized TFLite)
- - model_bytes.h (C header with `model_tflite[]` and length)
+Dependencies:
+    pip install -r requirements.txt
+    (see requirements.txt shipped alongside this script)
 
-Dependencies (see requirements.txt)
+Tested with: torch>=2.0, tensorflow>=2.15, onnx>=1.15
+
+-------------------------------------------------------------------------
+RUNNING LOCALLY IN VS CODE (Windows / macOS / Linux)
+-------------------------------------------------------------------------
+1. Open a terminal in the project folder (train_tiny_equalizer.py and
+   requirements.txt should sit side by side).
+
+2. Create and activate a virtual environment (recommended -- keeps this
+   project's TF/ONNX/torch versions isolated from other Python projects):
+
+     Windows (PowerShell):
+         python -m venv .venv
+         .venv\Scripts\Activate.ps1
+
+     macOS / Linux:
+         python3 -m venv .venv
+         source .venv/bin/activate
+
+   In VS Code, after creating the venv, select it as the interpreter:
+   Ctrl+Shift+P -> "Python: Select Interpreter" -> choose .venv.
+
+3. Install dependencies:
+
+       pip install -r requirements.txt
+
+4. Run the script (either from the VS Code "Run" button/F5, or the
+   integrated terminal):
+
+       python train_tiny_equalizer.py
+
+5. Output artifacts are written to the current working directory
+   (wherever you ran the command from):
+       tiny_equalizer_weights.pt   - raw PyTorch weights
+       tiny_equalizer.onnx         - ONNX export
+       tiny_equalizer_tf/          - intermediate TF SavedModel folder
+       tiny_equalizer_int8.tflite  - final quantized model
+       model_data.h                - C header for the ESP32 sketch
+
+   Copy model_data.h into the same folder as esp32_tiny_equalizer.ino
+   before compiling/flashing in the Arduino IDE.
+
+-------------------------------------------------------------------------
+RUNNING IN GOOGLE COLAB (alternative)
+-------------------------------------------------------------------------
+Upload both files to the Colab session, then in a cell:
+
+    !pip install -q -r requirements.txt
+    !python train_tiny_equalizer.py
+
+This script auto-detects Colab and will trigger a browser download of
+model_data.h / tiny_equalizer_int8.tflite / tiny_equalizer.onnx /
+tiny_equalizer_weights.pt automatically, since Colab's filesystem is
+ephemeral. On a local machine this download step is skipped and the
+files simply remain in your working directory (see step 5 above).
+=========================================================================
 """
 
 import os
-import math
 import numpy as np
-from typing import Tuple
-from sklearn.model_selection import train_test_split
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+
+# -------------------------------------------------------------------------
+# Reproducibility
+# -------------------------------------------------------------------------
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 
-# ----------------------------
-# Synthetic data generation
-# ----------------------------
-def generate_bpsk_samples(
-    num_samples: int,
-    snr_db_range: Tuple[float, float] = (5.0, 20.0),
-    phase_noise_var: float = 0.01,
-    iq_imbalance_gain: float = 0.05,
-    pa_clip_amp: float = 1.2,
-    seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray]:
+# =========================================================================
+# PART 1a: SYNTHETIC DATA GENERATION
+# =========================================================================
+def generate_data(num_samples: int,
+                   snr_db_range: tuple = (5.0, 20.0),
+                   phase_noise_std: float = 0.15,
+                   iq_gain_imbalance: float = 0.12,
+                   iq_phase_imbalance_deg: float = 5.0,
+                   rapp_saturation: float = 1.4,
+                   rapp_smoothness: float = 2.0):
     """
-    Generate corrupted BPSK received samples (I,Q) and labels (0/1).
+    Generates a synthetic dataset of hardware-impaired BPSK receptions.
+
+    Args:
+        num_samples: total number of symbols to generate.
+        snr_db_range: (min, max) SNR in dB, sampled uniformly per-symbol
+                       so the network learns to generalize across SNRs.
+        phase_noise_std: std-dev (radians) of the random oscillator phase
+                          jitter applied per symbol.
+        iq_gain_imbalance: fractional gain mismatch between I and Q paths
+                            (e.g., 0.12 => Q path amplified by 12%).
+        iq_phase_imbalance_deg: quadrature phase error in degrees between
+                                 the I and Q mixer paths (front-end non-ideality).
+        rapp_saturation: saturation (clipping) level 'A_sat' for the Rapp
+                          non-linear amplifier/receiver model.
+        rapp_smoothness: 'p' smoothness parameter of the Rapp model
+                          (higher p => sharper/harder clipping knee).
 
     Returns:
-      X: shape (num_samples, 2) float32 real,I and imag,Q
-      y: shape (num_samples,) int64 {0,1}
+        X: np.ndarray of shape [num_samples, 2]  -> [I, Q] received samples
+        y: np.ndarray of shape [num_samples]     -> original bits (0 or 1)
     """
-    rng = np.random.RandomState(seed)
+    # ---- 1. Generate true bits and BPSK symbol mapping (0->-1, 1->+1) ----
+    bits = np.random.randint(0, 2, size=num_samples).astype(np.float32)
+    symbols = (2.0 * bits - 1.0).astype(np.complex64)  # -> {-1+0j, +1+0j}
 
-    # Generate bits 0/1, map to BPSK symbols: 0 -> -1, 1 -> +1 (complex)
-    bits = rng.randint(0, 2, size=(num_samples,))
-    symbols = 2 * bits - 1  # +1 / -1 real baseband
+    # ---- 2. Rayleigh fading channel coefficient h (per-symbol, flat fading) ----
+    # IMPORTANT: we model only the fading *magnitude* |h| as Rayleigh
+    # (E[|h|^2] = 1), and assume the receiver's carrier-recovery loop has
+    # already tracked out the mean channel phase (standard for a coherent
+    # BPSK receiver). If we instead applied a fully complex h with a
+    # uniformly random phase per symbol, the label would become
+    # information-theoretically unrecoverable from a single [I,Q] sample:
+    # since symbols are real (+1/-1), faded = symbol * h, and for a
+    # uniform-phase h the distribution of faded given bit=1 is IDENTICAL
+    # to the distribution given bit=0 (h and -h are equally likely), so
+    # no memoryless per-symbol classifier could ever beat 50% accuracy.
+    # Real systems resolve this with pilot symbols / differential coding
+    # across a coherence block; here we instead let the residual
+    # per-symbol phase noise, I/Q imbalance and clipping (below) be the
+    # impairments the network must learn to see through, on top of the
+    # varying fade magnitude (which still requires the network to do a
+    # form of implicit, sample-adaptive "channel estimation" on the fly).
+    a = np.random.normal(0.0, np.sqrt(0.5), size=num_samples)
+    b = np.random.normal(0.0, np.sqrt(0.5), size=num_samples)
+    h_mag = np.sqrt(a ** 2 + b ** 2).astype(np.float32)  # Rayleigh-distributed magnitude
 
-    # Rayleigh fading: complex coefficient h ~ CN(0, sigma_h^2)
-    h_real = rng.normal(scale=math.sqrt(0.5), size=num_samples)
-    h_imag = rng.normal(scale=math.sqrt(0.5), size=num_samples)
-    h = h_real + 1j * h_imag  # complex channel coefficients
+    faded = symbols * h_mag  # channel-distorted signal (pre-hardware-impairment)
 
-    # Apply channel
-    tx = symbols.astype(np.complex64) * h  # complex transmitted after channel
+    # ---- 3. Phase noise (oscillator jitter) ----
+    phase_noise = np.random.normal(0.0, phase_noise_std, size=num_samples)
+    faded_pn = faded * np.exp(1j * phase_noise)
 
-    # Apply phase noise: multiplicative e^{j*phi}, phi ~ N(0, var)
-    phi = rng.normal(loc=0.0, scale=math.sqrt(phase_noise_var), size=num_samples)
-    tx = tx * np.exp(1j * phi)
+    # ---- 4. I/Q imbalance (gain mismatch + quadrature phase error) ----
+    # Split into I/Q, apply independent gain to Q branch and a phase skew
+    # between the I and Q local-oscillator paths (classic front-end model).
+    phi = np.deg2rad(iq_phase_imbalance_deg)
+    I = np.real(faded_pn)
+    Q = np.imag(faded_pn)
 
-    # I/Q imbalance: apply gain mismatch
-    g = iq_imbalance_gain
-    i = (1.0 + g) * tx.real
-    q = (1.0 - g) * tx.imag
+    # Gain mismatch: Q path scaled by (1 + iq_gain_imbalance)
+    I_g = I
+    Q_g = Q * (1.0 + iq_gain_imbalance)
 
-    # Recompose complex
-    rx = i + 1j * q
+    # Quadrature phase error: mixes a fraction of I into Q (and vice versa)
+    I_imb = I_g * np.cos(phi / 2.0) + Q_g * np.sin(phi / 2.0)
+    Q_imb = Q_g * np.cos(phi / 2.0) + I_g * np.sin(phi / 2.0)
 
-    # Non-linear PA / RX saturation: soft clipping (Rapp-like)
-    p = 2.0
-    A = pa_clip_amp
-    mag = np.abs(rx)
-    scale = 1.0 / np.power(1.0 + np.power(mag / A, 2.0 * p), 1.0 / (2.0 * p))
-    rx = rx * scale
+    iq_impaired = I_imb + 1j * Q_imb
 
-    # Add AWGN according to SNR (per-sample SNR draw from range)
-    snr_db = rng.uniform(snr_db_range[0], snr_db_range[1], size=num_samples)
-    signal_power = np.abs(rx) ** 2
-    snr_linear = 10 ** (snr_db / 10.0)
-    noise_variance = signal_power / snr_linear
-    noise_sigma = np.sqrt(noise_variance / 2.0)
+    # ---- 5. Non-linear receiver clipping (Rapp model) ----
+    # Rapp model applies an amplitude-dependent gain compression:
+    #   out = in / (1 + (|in|/A_sat)^(2p))^(1/2p)
+    # Phase is preserved; only the magnitude is compressed near saturation.
+    mag = np.abs(iq_impaired)
+    mag_safe = np.where(mag == 0, 1e-12, mag)
+    compression = (1.0 + (mag_safe / rapp_saturation) ** (2 * rapp_smoothness)) ** (1.0 / (2 * rapp_smoothness))
+    clipped = iq_impaired / compression
 
-    noise_real = rng.normal(scale=noise_sigma, size=num_samples)
-    noise_imag = rng.normal(scale=noise_sigma, size=num_samples)
-    rx_noisy = rx + noise_real + 1j * noise_imag
+    # ---- 6. AWGN thermal noise, calibrated to a per-symbol random SNR ----
+    snr_db = np.random.uniform(snr_db_range[0], snr_db_range[1], size=num_samples)
+    snr_linear = 10.0 ** (snr_db / 10.0)
 
-    # Final input is I and Q stacked
-    X = np.vstack([rx_noisy.real, rx_noisy.imag]).T.astype(np.float32)  # (N,2)
-    y = bits.astype(np.int64)
+    signal_power = np.mean(np.abs(clipped) ** 2)
+    noise_power = signal_power / snr_linear  # per-symbol target noise power
+
+    noise_std = np.sqrt(noise_power / 2.0)  # split across I and Q
+    noise = (np.random.normal(0.0, 1.0, size=num_samples) * noise_std +
+             1j * np.random.normal(0.0, 1.0, size=num_samples) * noise_std)
+
+    received = clipped + noise
+
+    # ---- 7. Build final [I, Q] feature matrix and label vector ----
+    X = np.stack([np.real(received), np.imag(received)], axis=1).astype(np.float32)
+    y = bits.astype(np.float32)
+
     return X, y
 
 
-# ----------------------------
-# TinyEqualizer model (PyTorch)
-# ----------------------------
+# =========================================================================
+# PART 1b: TINY NEURAL NETWORK ARCHITECTURE
+# =========================================================================
 class TinyEqualizer(nn.Module):
+    """
+    Ultra-lightweight MLP equalizer for TinyML deployment.
+
+    Architecture:
+        Input(2) -> Dense(16) + ReLU -> Dense(8) + ReLU -> Dense(1) + Sigmoid
+
+    Parameter count:
+        (2*16 + 16) + (16*8 + 8) + (8*1 + 1) = 48 + 136 + 9 = 193 parameters
+    """
+
     def __init__(self):
         super(TinyEqualizer, self).__init__()
         self.fc1 = nn.Linear(2, 16)
-        self.relu1 = nn.ReLU()
         self.fc2 = nn.Linear(16, 8)
-        self.relu2 = nn.ReLU()
         self.fc3 = nn.Linear(8, 1)
-        self.sig = nn.Sigmoid()
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu1(x)
-        x = self.fc2(x)
-        x = self.relu2(x)
-        x = self.fc3(x)
-        x = self.sig(x)
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.sigmoid(self.fc3(x))
         return x
 
+
 def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters())
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-# ----------------------------
-# Training and evaluation
-# ----------------------------
-def train_model(
-    model,
-    train_loader,
-    val_loader,
-    epochs: int = 12,
-    lr: float = 1e-3,
-    device: str = "cpu",
-):
+# =========================================================================
+# PART 1c: TRAINING & VALIDATION LOOP
+# =========================================================================
+def train_model(num_samples: int = 50_000,
+                 epochs: int = 60,
+                 batch_size: int = 256,
+                 lr: float = 1e-3,
+                 device: str = "cpu"):
+    """
+    Generates data, trains TinyEqualizer, and evaluates BER on a held-out
+    test split.
+
+    Returns:
+        model: trained TinyEqualizer (in eval mode)
+        (X_test, y_test): held-out numpy test data, for later use
+    """
+    print("=" * 70)
+    print("Generating synthetic hardware-impaired BPSK dataset...")
+    X, y = generate_data(num_samples, snr_db_range=(5.0, 20.0))
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=SEED, shuffle=True
+    )
+
+    train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train).unsqueeze(1))
+    test_ds = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test).unsqueeze(1))
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False)
+
+    model = TinyEqualizer().to(device)
+    print(f"Model parameter count: {count_parameters(model)} (target: <1000)")
+
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    model.to(device)
 
+    print("=" * 70)
+    print("Training TinyEqualizer...")
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
         for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device).float().unsqueeze(1)
+            xb, yb = xb.to(device), yb.to(device)
+
             optimizer.zero_grad()
-            outputs = model(xb)
-            loss = criterion(outputs, yb)
+            preds = model(xb)
+            loss = criterion(preds, yb)
             loss.backward()
             optimizer.step()
+
             running_loss += loss.item() * xb.size(0)
-        epoch_loss = running_loss / len(train_loader.dataset)
 
-        # Validation
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
-                outputs = model(xb).squeeze(1)
-                preds = (outputs >= 0.5).long()
-                correct += (preds.cpu() == yb.cpu()).sum().item()
-                total += yb.size(0)
-        val_acc = correct / total
-        print(f"Epoch {epoch}/{epochs}  Loss: {epoch_loss:.6f}  ValAcc: {val_acc:.4f}")
+        epoch_loss = running_loss / len(train_ds)
 
-    return model
+        if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
+            train_acc = evaluate_accuracy(model, train_loader, device)
+            test_acc = evaluate_accuracy(model, test_loader, device)
+            print(f"Epoch [{epoch:3d}/{epochs}]  Loss: {epoch_loss:.5f}  "
+                  f"Train Acc: {train_acc*100:.2f}%  Test Acc: {test_acc*100:.2f}%")
 
-def evaluate_ber(model, loader, device="cpu"):
+    print("=" * 70)
+    print("Final Evaluation")
+    final_test_acc = evaluate_accuracy(model, test_loader, device)
+    ber = compute_ber(model, X_test, y_test, device)
+    print(f"Final Test Accuracy : {final_test_acc*100:.3f}%")
+    print(f"Final Bit Error Rate: {ber:.6f}  ({ber*100:.4f}%)")
+    print("=" * 70)
+
     model.eval()
-    total_bits = 0
-    total_errors = 0
+    return model, (X_test, y_test)
+
+
+def evaluate_accuracy(model: nn.Module, loader: DataLoader, device: str) -> float:
+    model.eval()
+    correct, total = 0, 0
     with torch.no_grad():
         for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            outputs = model(xb).squeeze(1)
-            preds = (outputs >= 0.5).long()
-            total_errors += (preds.cpu() != yb.cpu()).sum().item()
-            total_bits += yb.numel()
-    ber = total_errors / total_bits
-    acc = 1.0 - ber
-    return ber, acc
+            xb, yb = xb.to(device), yb.to(device)
+            preds = model(xb)
+            predicted_bits = (preds >= 0.5).float()
+            correct += (predicted_bits == yb).sum().item()
+            total += yb.size(0)
+    return correct / total
 
 
-# ----------------------------
-# Export: PyTorch -> ONNX -> TF SavedModel -> TFLite (int8)
-# ----------------------------
-def export_to_onnx(model: nn.Module, example_input: torch.Tensor, onnx_path: str):
+def compute_ber(model: nn.Module, X_test: np.ndarray, y_test: np.ndarray, device: str) -> float:
+    """Computes Bit Error Rate: fraction of decoded bits that differ from truth."""
     model.eval()
-    torch.onnx.export(
-        model,
-        example_input,
-        onnx_path,
-        input_names=["input"],
-        output_names=["output"],
-        opset_version=11,
-        dynamic_axes=None,
-    )
-    print(f"Saved ONNX to {onnx_path}")
+    with torch.no_grad():
+        xb = torch.from_numpy(X_test).to(device)
+        preds = model(xb).cpu().numpy().flatten()
+    decoded_bits = (preds >= 0.5).astype(np.float32)
+    bit_errors = np.sum(decoded_bits != y_test)
+    ber = bit_errors / len(y_test)
+    return ber
 
-def onnx_to_tf_saved_model(onnx_path: str, saved_model_dir: str):
-    import onnx
-    from onnx_tf.backend import prepare
 
-    model_onnx = onnx.load(onnx_path)
-    tf_rep = prepare(model_onnx)
-    tf_rep.export_graph(saved_model_dir)
-    print(f"Saved TensorFlow SavedModel to {saved_model_dir}")
+# =========================================================================
+# PART 1d: EXPORT & QUANTIZATION PIPELINE (ONNX -> TF -> TFLite int8)
+# =========================================================================
+def export_to_onnx(model: nn.Module, onnx_path: str = "tiny_equalizer.onnx"):
+    """
+    Exports the trained PyTorch model to ONNX format.
 
-def convert_saved_model_to_tflite(saved_model_dir: str, tflite_path: str, representative_data: np.ndarray):
+    NOTE: recent PyTorch versions (>=2.5) default to a new dynamo-based
+    ONNX exporter that, for some opset_version targets, routes through an
+    internal "export at opset18 then down-convert" path. That down-convert
+    step has known gaps for simple ops like Relu on some torch/onnx/
+    onnxscript version combos, and can throw a RuntimeError even though
+    the export itself would otherwise succeed. We explicitly request the
+    legacy (non-dynamo) TorchScript-based exporter, which targets
+    opset_version directly and is the most broadly compatible path for
+    onnx2tf/TFLite conversion downstream.
+    """
+    model.eval()
+    dummy_input = torch.randn(1, 2, dtype=torch.float32)
+
+    try:
+        # Preferred: explicitly force the legacy exporter (torch>=2.5 has
+        # the 'dynamo' kwarg; older torch versions don't and default to
+        # legacy behavior anyway).
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+            opset_version=13,
+            dynamo=False,
+        )
+    except TypeError:
+        # Older torch without the 'dynamo' kwarg -- this call already uses
+        # the legacy exporter by default.
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+            opset_version=13,
+        )
+
+    print(f"[OK] ONNX model exported to: {onnx_path}")
+    return onnx_path
+
+
+def convert_onnx_to_tflite_int8(onnx_path: str,
+                                 representative_X: np.ndarray,
+                                 tf_saved_model_dir: str = "tiny_equalizer_tf",
+                                 tflite_out_path: str = "tiny_equalizer_int8.tflite"):
+    """
+    Converts an ONNX model to a fully-quantized (int8) TFLite model.
+
+    Steps:
+        1. ONNX -> TensorFlow SavedModel   (via onnx2tf)
+        2. TensorFlow SavedModel -> TFLite (via TFLiteConverter)
+        3. Post-training full-integer quantization using a representative
+           dataset drawn from real (or synthetic) receiver samples.
+
+    Requires: pip install onnx2tf tensorflow onnx onnx_graphsurgeon sng4onnx
+    """
+    import subprocess
+    import sys
     import tensorflow as tf
 
-    converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    # ---- Step 1: ONNX -> TensorFlow SavedModel via onnx2tf CLI ----
+    # NOTE: -osd ("--output_signaturedefs") only attaches serving
+    # signatures to whatever is exported -- it does NOT by itself produce
+    # a SavedModel directory. The flag that actually emits a loadable
+    # SavedModel (saved_model.pb + variables/) is -fdosm
+    # ("--flatbuffer_direct_output_saved_model"), confirmed against
+    # onnx2tf 2.6.x. Using -osd alone leaves no saved_model.pb behind and
+    # the next step fails with "SavedModel file does not exist".
+    print("[..] Converting ONNX -> TensorFlow SavedModel (onnx2tf)...")
+    result = subprocess.run(
+        [sys.executable, "-m", "onnx2tf",
+         "-i", onnx_path,
+         "-o", tf_saved_model_dir,
+         "-fdosm"],  # emit an actual SavedModel directory
+        capture_output=True, text=True
+    )
+    if result.returncode != 0 or not os.path.exists(os.path.join(tf_saved_model_dir, "saved_model.pb")):
+        print("onnx2tf STDOUT:\n", result.stdout)
+        print("onnx2tf STDERR:\n", result.stderr)
+        raise RuntimeError(
+            "onnx2tf did not produce a SavedModel. See output above. "
+            "Ensure `onnx2tf`, `tensorflow`, and their dependencies "
+            "(see requirements.txt) are installed, and that the onnx2tf "
+            "version you have still supports the -fdosm flag "
+            "(`python -m onnx2tf --help` to check)."
+        )
+    print(f"[OK] TensorFlow SavedModel written to: {tf_saved_model_dir}")
 
-    def representative_gen():
-        for i in range(min(100, representative_data.shape[0])):
-            sample = representative_data[i : i + 1].astype(np.float32)
+    # ---- Step 2 + 3: SavedModel -> int8 TFLite with representative dataset ----
+    def representative_dataset_gen():
+        # Use a subset of real corrupted receiver samples so the quantizer
+        # calibrates activation ranges to realistic signal statistics.
+        n = min(500, len(representative_X))
+        idx = np.random.choice(len(representative_X), n, replace=False)
+        for i in idx:
+            sample = representative_X[i:i + 1].astype(np.float32)  # shape [1,2]
             yield [sample]
 
-    converter.representative_dataset = representative_gen
+    converter = tf.lite.TFLiteConverter.from_saved_model(tf_saved_model_dir)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_dataset_gen
+
+    # Force full integer quantization (weights + activations -> int8),
+    # which is required for many microcontroller TFLite-Micro kernels.
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
 
     tflite_model = converter.convert()
 
-    with open(tflite_path, "wb") as f:
+    with open(tflite_out_path, "wb") as f:
         f.write(tflite_model)
-    print(f"Saved quantized TFLite to {tflite_path}")
-    return tflite_model
 
-def write_c_header_from_tflite(tflite_bytes: bytes, header_path: str, array_name: str = "model_tflite"):
+    print(f"[OK] Quantized int8 TFLite model written to: {tflite_out_path}")
+    print(f"[OK] Model size: {len(tflite_model)} bytes")
+    return tflite_out_path
+
+
+def tflite_to_c_header(tflite_path: str, header_path: str = "model_data.h",
+                        array_name: str = "model_tflite"):
+    """
+    Converts the .tflite binary into a C header file containing a byte
+    array, ready to `#include` in the ESP32 Arduino/ESP-IDF sketch.
+    Equivalent to running: `xxd -i model.tflite > model_data.h`
+    """
+    with open(tflite_path, "rb") as f:
+        data = f.read()
+
     with open(header_path, "w") as f:
-        f.write("#ifndef MODEL_BYTES_H\n")
-        f.write("#define MODEL_BYTES_H\n\n")
-        f.write("#include <cstddef>\n\n")
-        f.write(f"// Generated model binary (size = {len(tflite_bytes)} bytes)\n")
-        f.write(f"const unsigned char {array_name}[] = {{\n")
-        for i in range(len(tflite_bytes)):
+        f.write("// Auto-generated from {}\n".format(tflite_path))
+        f.write("// Do not edit by hand.\n\n")
+        f.write("#ifndef MODEL_DATA_H\n#define MODEL_DATA_H\n\n")
+        f.write("alignas(8) const unsigned char {}[] = {{\n".format(array_name))
+
+        for i, byte in enumerate(data):
             if i % 12 == 0:
                 f.write("  ")
-            f.write(f"0x{tflite_bytes[i]:02x}")
-            if i != len(tflite_bytes) - 1:
-                f.write(", ")
-            if (i + 1) % 12 == 0:
+            f.write(f"0x{byte:02x}, ")
+            if i % 12 == 11:
                 f.write("\n")
-        f.write("\n};\n\n")
-        f.write(f"const unsigned int {array_name}_len = {len(tflite_bytes)};\n\n")
-        f.write("#endif // MODEL_BYTES_H\n")
-    print(f"Wrote C header to {header_path}")
+
+        f.write("\n};\n")
+        f.write(f"const unsigned int {array_name}_len = {len(data)};\n\n")
+        f.write("#endif // MODEL_DATA_H\n")
+
+    print(f"[OK] C header written to: {header_path}  ({len(data)} bytes -> array '{array_name}')")
+    return header_path
 
 
-# ----------------------------
-# Main runnable flow
-# ----------------------------
-def main():
-    NUM_SAMPLES = 50000
-    TEST_SIZE = 0.2
-    BATCH_SIZE = 256
-    EPOCHS = 12
-    SEED = 42
-
-    print("Generating synthetic dataset...")
-    X, y = generate_bpsk_samples(
-        num_samples=NUM_SAMPLES,
-        snr_db_range=(5.0, 20.0),
-        phase_noise_var=0.02,
-        iq_imbalance_gain=0.06,
-        pa_clip_amp=1.1,
-        seed=SEED,
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=SEED, stratify=y
-    )
-
-    train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-    val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-
-    model = TinyEqualizer()
-    print("Model parameter count:", count_parameters(model))
-    assert count_parameters(model) < 1000, "Model too large for TinyML target."
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Training on device:", device)
-    model = train_model(model, train_loader, val_loader, epochs=EPOCHS, lr=1e-3, device=device)
-
-    val_loader_full = DataLoader(val_ds, batch_size=1024, shuffle=False)
-    ber, acc = evaluate_ber(model, val_loader_full, device=device)
-    print(f"Validation BER: {ber:.6f}  Accuracy: {acc:.6f}")
-
-    os.makedirs("out", exist_ok=True)
-    torch.save(model.state_dict(), "out/tiny_equalizer.pt")
-    print("Saved PyTorch weights to out/tiny_equalizer.pt")
-
-    dummy_input = torch.zeros((1, 2), dtype=torch.float32)
-    export_to_onnx(model.cpu(), dummy_input, "out/tiny_equalizer.onnx")
-
-    try:
-        onnx_to_tf_saved_model("out/tiny_equalizer.onnx", "out/saved_model")
-    except Exception as e:
-        print("ONNX -> TF conversion failed. Ensure onnx and onnx-tf are installed.")
-        raise
-
-    tflite_model = convert_saved_model_to_tflite("out/saved_model", "out/tiny_equalizer_quant.tflite", X_train)
-
-    write_c_header_from_tflite(tflite_model, "out/model_bytes.h", array_name="model_tflite")
-
-    print("All artifacts written to out/ directory.")
-    print("Next: copy out/model_bytes.h into your ESP32 project and include in the sketch.")
-
+# =========================================================================
+# MAIN
+# =========================================================================
 if __name__ == "__main__":
-    main()
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {DEVICE}")
+
+    # ---- 1. Train ----
+    trained_model, (X_test, y_test) = train_model(
+        num_samples=50_000,
+        epochs=60,
+        batch_size=256,
+        lr=1e-3,
+        device=DEVICE,
+    )
+
+    # ---- 2. Save raw PyTorch weights (optional, for reproducibility) ----
+    torch.save(trained_model.state_dict(), "tiny_equalizer_weights.pt")
+    print("[OK] PyTorch weights saved to tiny_equalizer_weights.pt")
+
+    # ---- 3. Export to ONNX ----
+    onnx_path = export_to_onnx(trained_model.to("cpu"), "tiny_equalizer.onnx")
+
+    # ---- 4. Convert ONNX -> TFLite (int8 quantized) ----
+    # NOTE: This step requires `onnx2tf` and `tensorflow` to be installed.
+    # If your environment cannot run onnx2tf, run this step separately
+    # in a dedicated Python (TF) environment using the same function.
+    try:
+        tflite_path = convert_onnx_to_tflite_int8(
+            onnx_path=onnx_path,
+            representative_X=X_test,
+            tf_saved_model_dir="tiny_equalizer_tf",
+            tflite_out_path="tiny_equalizer_int8.tflite",
+        )
+
+        # ---- 5. Convert .tflite -> C header for ESP32 ----
+        tflite_to_c_header(tflite_path, header_path="model_data.h", array_name="model_tflite")
+
+    except Exception as e:
+        print("=" * 70)
+        print("TFLite conversion step failed or was skipped in this environment.")
+        print("Reason:", str(e))
+        print("You can re-run convert_onnx_to_tflite_int8() and tflite_to_c_header()")
+        print("independently once onnx2tf / tensorflow are available.")
+        print("=" * 70)
+
+    # ---- 6. If running inside Google Colab, auto-download key artifacts ----
+    # Colab's VM filesystem is wiped when the session disconnects, so the
+    # model header/weights/tflite file are pushed to the browser download
+    # tray automatically instead of being left only in /content/.
+    try:
+        import google.colab  # noqa: F401  (only succeeds inside Colab)
+        from google.colab import files as colab_files
+
+        print("=" * 70)
+        print("Google Colab environment detected -- downloading artifacts...")
+        for fname in ["model_data.h",
+                      "tiny_equalizer_int8.tflite",
+                      "tiny_equalizer.onnx",
+                      "tiny_equalizer_weights.pt"]:
+            if os.path.exists(fname):
+                colab_files.download(fname)
+                print(f"[OK] Triggered download: {fname}")
+            else:
+                print(f"[skip] {fname} not found (an earlier step may have failed).")
+        print("=" * 70)
+    except ImportError:
+        # Not running in Colab -- artifacts are simply left in the local
+        # working directory, no action needed.
+        pass
