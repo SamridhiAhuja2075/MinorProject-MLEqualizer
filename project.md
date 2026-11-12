@@ -120,6 +120,10 @@ The script writes:
   configuration, and BER, accuracy, and ROC AUC at each SNR;
 - `bpsk_cnn_benchmark_results.png` — BER curves and the denoiser's I/Q
   constellation comparison at 12 dB.
+- `bpsk_roc_auc_results.png` — ROC curves for all six models at 12 dB and
+  ROC AUC versus SNR;
+- `training_epoch_analysis.png` — validation accuracy and training loss
+  across all 20 epochs for every model.
 
 ## How to read the results
 
@@ -150,23 +154,40 @@ benchmark, not a guarantee of real-time performance on a radio.
 ## What this benchmark run found
 
 In the recorded CPU run, the denoising autoencoder had the lowest BER at
-20 dB: about **0.0412** (roughly 4 errors per 100 bits in this finite test
-set). The ResNet reached about **0.1144**, and the center-sample MLP about
-**0.1869** at the same SNR. The other three convolutional models did not
+20 dB: about **0.0411** (roughly 4 errors per 100 bits in this finite test
+set). The ResNet reached about **0.0967**, and the center-sample MLP about
+**0.1865** at the same SNR. The other three convolutional models did not
 beat the MLP in this 20-epoch run, so using a CNN did not automatically
 improve detection.
 
-The denoising autoencoder also ranked best by accuracy (**95.88%**) and
-ROC AUC (**0.9900**) at 20 dB. Across all 11 SNR points, its average
-accuracy was **89.63%** and average ROC AUC was **0.9472**. The JSON file
+The denoising autoencoder also ranked best by accuracy (**95.90%**) and
+ROC AUC (**0.9907**) at 20 dB. Across all 11 SNR points, its average
+accuracy was **89.50%** and average ROC AUC was **0.9470**. The JSON file
 contains the accuracy and AUC comparison for each model at every SNR.
 
 The MLP was the smallest and fastest model in this run: **641 parameters**
-and about **12.2 ms per 10,000 windows**. The DAE used **13,061 parameters**
-and about **224.6 ms per 10,000 windows**. These measurements depend on the
+and about **9.7 ms per 10,000 windows**. The DAE used **13,061 parameters**
+and about **162.7 ms per 10,000 windows**. These measurements depend on the
 host computer and synthetic setup; the technical table in
 [`research_paper.md`](./research_paper.md) summarizes accuracy and ROC AUC
 alongside the BER tables; the JSON includes their values at every SNR.
+
+All models receive 20 training epochs. In this run, ResNet accuracy
+continued to improve through epoch 20, while the MLP and autoencoder were
+near their best validation accuracy earlier. See
+[`training_epoch_analysis.png`](./training_epoch_analysis.png) and the
+epoch-by-epoch `training_history` in the metrics JSON for all six models.
+
+## How training changes over epochs
+
+Each model is trained for 20 complete passes over the training windows.
+Open `training_epoch_analysis.png` to compare each model's validation
+accuracy and training loss at every epoch. Improving accuracy and falling
+loss generally show that training is progressing; a flat validation curve
+can mean that a model has stopped improving under this setup. Compare both
+curves: training loss alone does not show whether performance on separate
+validation bursts is improving. The exact epoch-by-epoch values are stored
+in the `training_history` section of `benchmark_metrics.json`.
 
 ## Scope and limitations
 

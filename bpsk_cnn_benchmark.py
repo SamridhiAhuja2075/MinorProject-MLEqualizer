@@ -406,11 +406,16 @@ def _train_one(
     train_loader: DataLoader[tuple[Tensor, ...]],
     validation_loader: DataLoader[tuple[Tensor, ...]],
     config: BenchmarkConfig,
-) -> None:
+) -> dict[str, list[float]]:
     model.to(config.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     bce = nn.BCEWithLogitsLoss()
     mse = nn.MSELoss()
+    history = {
+        "training_loss": [],
+        "validation_accuracy": [],
+        "validation_roc_auc": [],
+    }
     for epoch in range(config.epochs):
         model.train()
         total_loss = 0.0
@@ -428,15 +433,21 @@ def _train_one(
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * inputs.size(0)
-        if epoch in (0, config.epochs - 1):
-            validation_ber = evaluate_ber(model, validation_loader, config.device)
-            print(
-                f"  epoch {epoch + 1:02d}/{config.epochs}: "
-                f"loss={total_loss / len(train_loader.dataset):.4f}, "
-                f"validation BER={validation_ber:.5f}",
-                flush=True,
-            )
+        training_loss = total_loss / len(train_loader.dataset)
+        validation_accuracy, validation_roc_auc = evaluate_classification(
+            model, validation_loader, config.device
+        )
+        history["training_loss"].append(training_loss)
+        history["validation_accuracy"].append(validation_accuracy)
+        history["validation_roc_auc"].append(validation_roc_auc)
+        print(
+            f"  epoch {epoch + 1:02d}/{config.epochs}: "
+            f"loss={training_loss:.4f}, val_acc={validation_accuracy:.4f}, "
+            f"val_auc={validation_roc_auc:.4f}",
+            flush=True,
+        )
     model.eval()
+    return history
 
 
 @torch.inference_mode()
@@ -475,21 +486,59 @@ def _roc_auc(labels: NDArray[np.bool_], scores: NDArray[np.float64]) -> float:
     )
 
 
+def _roc_curve_points(
+    labels: NDArray[np.bool_], scores: NDArray[np.float64]
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return empirical false-positive and true-positive rates."""
+    positive_count = int(labels.sum())
+    negative_count = len(labels) - positive_count
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError("ROC curve requires at least one sample from each class.")
+
+    order = np.argsort(-scores, kind="mergesort")
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    true_positives = [0]
+    false_positives = [0]
+    start = 0
+    while start < len(scores):
+        end = start + 1
+        while end < len(scores) and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        true_positives.append(
+            true_positives[-1] + int(sorted_labels[start:end].sum())
+        )
+        false_positives.append(
+            false_positives[-1] + int((~sorted_labels[start:end]).sum())
+        )
+        start = end
+
+    return (
+        np.asarray(false_positives, dtype=np.float64) / negative_count,
+        np.asarray(true_positives, dtype=np.float64) / positive_count,
+    )
+
+
 @torch.inference_mode()
-def evaluate_classification(
+def _classification_scores(
     model: nn.Module, loader: DataLoader, device: str
-) -> tuple[float, float]:
-    """Return thresholded accuracy and threshold-independent ROC AUC."""
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
     model.eval()
     all_logits: list[NDArray[np.float64]] = []
     all_labels: list[NDArray[np.bool_]] = []
     for inputs, labels, _ in loader:
         logits = _logits(model, inputs.to(device)).squeeze(1)
         all_logits.append(logits.cpu().numpy().astype(np.float64, copy=False))
-        all_labels.append((labels.squeeze(1).numpy() >= 0.5))
+        all_labels.append(labels.squeeze(1).numpy() >= 0.5)
+    return np.concatenate(all_logits), np.concatenate(all_labels)
 
-    scores = np.concatenate(all_logits)
-    targets = np.concatenate(all_labels)
+
+@torch.inference_mode()
+def evaluate_classification(
+    model: nn.Module, loader: DataLoader, device: str
+) -> tuple[float, float]:
+    """Return thresholded accuracy and threshold-independent ROC AUC."""
+    scores, targets = _classification_scores(model, loader, device)
     accuracy = float(np.mean((scores >= 0.0) == targets))
     return accuracy, _roc_auc(targets, scores)
 
@@ -568,6 +617,77 @@ def _save_figure(
     plt.close(figure)
 
 
+def _save_roc_figure(
+    snrs: tuple[int, ...],
+    auc_results: dict[str, dict[str, float]],
+    roc_at_12_db: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
+) -> None:
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    for name, (false_positive_rate, true_positive_rate) in roc_at_12_db.items():
+        auc = auc_results[name]["12"]
+        axes[0].plot(
+            false_positive_rate,
+            true_positive_rate,
+            label=f"{name} (AUC={auc:.3f})",
+        )
+    axes[0].plot([0, 1], [0, 1], "k--", linewidth=1, label="Chance")
+    axes[0].set(
+        title="ROC curves at 12 dB",
+        xlabel="False positive rate",
+        ylabel="True positive rate",
+        xlim=(0, 1),
+        ylim=(0, 1),
+    )
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=8)
+
+    for name, values in auc_results.items():
+        axes[1].plot(
+            snrs,
+            [values[str(snr)] for snr in snrs],
+            marker="o",
+            label=name,
+        )
+    axes[1].set(
+        title="ROC AUC versus SNR",
+        xlabel="SNR (dB)",
+        ylabel="ROC AUC",
+        ylim=(0.0, 1.0),
+    )
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=8)
+    figure.tight_layout()
+    figure.savefig("bpsk_roc_auc_results.png", dpi=180)
+    plt.close(figure)
+
+
+def _save_epoch_figure(
+    histories: dict[str, dict[str, list[float]]],
+) -> None:
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    for name, history in histories.items():
+        epochs = range(1, len(history["training_loss"]) + 1)
+        axes[0].plot(epochs, history["validation_accuracy"], marker=".", label=name)
+        axes[1].plot(epochs, history["training_loss"], marker=".", label=name)
+    axes[0].set(
+        title="Validation accuracy by training epoch",
+        xlabel="Epoch",
+        ylabel="Validation accuracy",
+        ylim=(0.0, 1.0),
+    )
+    axes[1].set(
+        title="Training loss by epoch",
+        xlabel="Epoch",
+        ylabel="Training loss",
+    )
+    for axis in axes:
+        axis.grid(True, alpha=0.3)
+        axis.legend(fontsize=8)
+    figure.tight_layout()
+    figure.savefig("training_epoch_analysis.png", dpi=180)
+    plt.close(figure)
+
+
 def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
     config = config or BenchmarkConfig()
     random.seed(config.seed)
@@ -593,18 +713,22 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
 
     models: dict[str, nn.Module] = {}
     complexity: dict[str, dict[str, float | int]] = {}
+    training_history: dict[str, dict[str, list[float]]] = {}
     for name, factory in MODEL_FACTORIES.items():
         torch.manual_seed(config.seed)
         model = factory()
         parameter_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
         print(f"\nTraining {name} ({parameter_count:,} trainable parameters)", flush=True)
-        _train_one(model, train_loader, validation_loader, config)
+        training_history[name] = _train_one(
+            model, train_loader, validation_loader, config
+        )
         models[name] = model
         complexity[name] = {"trainable_parameters": parameter_count}
 
     sweep_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
     accuracy_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
     roc_auc_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
+    roc_at_12_db: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
     constellation_inputs: FloatArray | None = None
     for snr in config.snr_sweep_db:
         print(f"\nEvaluating SNR {snr} dB...", flush=True)
@@ -613,10 +737,14 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         )
         loader = _loader(arrays, 1024)
         for name, model in models.items():
-            accuracy, roc_auc = evaluate_classification(model, loader, config.device)
+            scores, labels = _classification_scores(model, loader, config.device)
+            accuracy = float(np.mean((scores >= 0.0) == labels))
+            roc_auc = _roc_auc(labels, scores)
             accuracy_results[name][str(snr)] = accuracy
             sweep_results[name][str(snr)] = 1.0 - accuracy
             roc_auc_results[name][str(snr)] = roc_auc
+            if snr == 12:
+                roc_at_12_db[name] = _roc_curve_points(labels, scores)
         if snr == 12:
             constellation_inputs = arrays[0]
 
@@ -641,6 +769,9 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         autoencoder,
         config,
     )
+    _save_roc_figure(config.snr_sweep_db, roc_auc_results, roc_at_12_db)
+    _save_epoch_figure(training_history)
+    snr_keys = [str(snr) for snr in config.snr_sweep_db]
     metrics: dict[str, object] = {
         "configuration": asdict(config),
         "device": config.device,
@@ -651,8 +782,19 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         "ber_vs_snr": sweep_results,
         "accuracy_vs_snr": accuracy_results,
         "roc_auc_vs_snr": roc_auc_results,
+        "mean_accuracy_across_snr": {
+            name: float(np.mean([values[snr] for snr in snr_keys]))
+            for name, values in accuracy_results.items()
+        },
+        "mean_roc_auc_across_snr": {
+            name: float(np.mean([values[snr] for snr in snr_keys]))
+            for name, values in roc_auc_results.items()
+        },
+        "training_history": training_history,
         "latency_method": "Median of 3 CPU/GPU inference passes, batch size 256, exactly 10,000 windows when available.",
         "figure": "bpsk_cnn_benchmark_results.png",
+        "roc_figure": "bpsk_roc_auc_results.png",
+        "epoch_figure": "training_epoch_analysis.png",
     }
     Path("benchmark_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print("\nSaved benchmark_metrics.json and bpsk_cnn_benchmark_results.png", flush=True)

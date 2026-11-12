@@ -15,12 +15,12 @@ on 200 separate validation bursts and on 150 bursts at each SNR from 0 to
 20 dB in 2 dB increments. The benchmark records measured bit-error rate
 (BER), thresholded accuracy, ROC area under the curve (AUC), trainable
 parameter count, and inference latency per 10,000 windows.
-In this CPU run, the lowest measured BER was **0.04118** for the denoising
-autoencoder at **20 dB**. Latency ranged from **12.228 ms** to **546.000 ms**
+In this CPU run, the lowest measured BER was **0.04105** for the denoising
+autoencoder at **20 dB**. Latency ranged from **9.651 ms** to **390.541 ms**
 per 10,000 windows, and model sizes ranged from **641** to **24,449**
 trainable parameters. Across the 11 SNR points, DenoisingAE1D had the
-highest mean accuracy (**0.89633**) and mean ROC AUC (**0.94717**). At
-20 dB, its accuracy was **0.95882** and ROC AUC was **0.99004**. These
+highest mean accuracy (**0.89496**) and mean ROC AUC (**0.94701**). At
+20 dB, its accuracy was **0.95895** and ROC AUC was **0.99068**. These
 results characterize the specified synthetic simulation and should not be
 interpreted as over-the-air performance.
 
@@ -167,43 +167,46 @@ The training set contains 1,000 bursts (51,000 windows); validation contains
 at zero. Accuracy is the fraction of correct center-bit decisions; BER is
 the fraction of incorrect decisions on the same samples. ROC AUC is
 calculated from raw logits using the rank-sum definition with average ranks
-for tied scores. Detailed accuracy and AUC are recorded at each SNR in
-`benchmark_metrics.json`; the summary table below reports the arithmetic
-mean across SNR points as well as the 12 dB comparison. Latency is the
+for tied scores. The following tables report accuracy and AUC separately at
+every tested SNR, with their across-SNR means retained as a compact summary.
+Latency is the
 median of three inference passes over 10,000 validation windows in batches
 of 256, on the recorded device. Parameter counts include trainable weights
 and biases.
 
 ### A. Complexity and latency
 
-| Model | Trainable parameters | Latency (ms / 10,000 windows) |
-|---|---:|---:|
-| MLPBaseline | 641 | 12.228 |
-| VanillaCNN1D | 19,169 | 276.185 |
-| ResNet1D | 24,449 | 428.587 |
-| Inception1D | 11,009 | 546.000 |
-| DenseNet1D | 7,505 | 288.589 |
-| DenoisingAE1D | 13,061 | 224.577 |
+| Model | Trainable parameters | Latency (ms / 10,000 windows) | Mean accuracy | Mean ROC AUC |
+|---|---:|---:|---:|---:|
+| MLPBaseline | 641 | 9.651 | 0.78617 | 0.86682 |
+| VanillaCNN1D | 19,169 | 203.795 | 0.67597 | 0.74401 |
+| ResNet1D | 24,449 | 305.544 | 0.85153 | 0.92055 |
+| Inception1D | 11,009 | 390.541 | 0.73908 | 0.81765 |
+| DenseNet1D | 7,505 | 199.196 | 0.66737 | 0.73507 |
+| DenoisingAE1D | 13,061 | 162.653 | 0.89496 | 0.94701 |
+
+Mean accuracy and mean ROC AUC are unweighted arithmetic means of the
+per-SNR results across the 11 equally weighted SNR points.
 
 ### B. BER versus SNR
 
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0  | 0.26523 | 0.36170 | 0.26941 | 0.31843 | 0.36575 | 0.24484 |
-| 2  | 0.25686 | 0.35516 | 0.24340 | 0.30614 | 0.35778 | 0.20105 |
-| 4  | 0.23163 | 0.33477 | 0.20627 | 0.28118 | 0.34039 | 0.16065 |
-| 6  | 0.22013 | 0.32980 | 0.18471 | 0.27529 | 0.33412 | 0.12418 |
-| 8  | 0.21007 | 0.33346 | 0.17163 | 0.27634 | 0.33974 | 0.09935 |
-| 10 | 0.20327 | 0.31882 | 0.13595 | 0.25752 | 0.32039 | 0.07072 |
-| 12 | 0.19190 | 0.31699 | 0.12967 | 0.25739 | 0.32366 | 0.05660 |
-| 14 | 0.20758 | 0.31033 | 0.12209 | 0.25817 | 0.31843 | 0.04863 |
-| 16 | 0.19046 | 0.31569 | 0.11556 | 0.26536 | 0.32000 | 0.04680 |
-| 18 | 0.19294 | 0.31007 | 0.12510 | 0.25163 | 0.31203 | 0.04641 |
-| 20 | 0.18693 | 0.30719 | 0.11438 | 0.25595 | 0.31673 | 0.04118 |
+| 0  | 0.26601 | 0.35595 | 0.25634 | 0.30209 | 0.35895 | 0.24052 |
+| 2  | 0.25608 | 0.35072 | 0.23869 | 0.29124 | 0.35778 | 0.21098 |
+| 4  | 0.23046 | 0.32980 | 0.19647 | 0.26719 | 0.33961 | 0.16131 |
+| 6  | 0.21856 | 0.33150 | 0.16810 | 0.26641 | 0.33739 | 0.12784 |
+| 8  | 0.20993 | 0.33033 | 0.14784 | 0.26680 | 0.33634 | 0.10131 |
+| 10 | 0.20248 | 0.31464 | 0.11765 | 0.25098 | 0.32588 | 0.06902 |
+| 12 | 0.19124 | 0.31176 | 0.11386 | 0.24771 | 0.32157 | 0.05895 |
+| 14 | 0.20732 | 0.30837 | 0.10235 | 0.24536 | 0.31686 | 0.05124 |
+| 16 | 0.19098 | 0.31647 | 0.09399 | 0.24693 | 0.32745 | 0.04588 |
+| 18 | 0.19255 | 0.30471 | 0.10118 | 0.24170 | 0.31804 | 0.04732 |
+| 20 | 0.18654 | 0.31007 | 0.09673 | 0.24366 | 0.31908 | 0.04105 |
 
 **Measured summary:** The minimum BER over all models and SNR points was
-0.04118 for DenoisingAE1D at 20 dB. The DAE also had the lowest BER at 12 dB
-(0.05660); the ResNet reached 0.12967 and the MLP 0.19190 at that SNR. The
+0.04105 for DenoisingAE1D at 20 dB. The DAE also had the lowest BER at 12 dB
+(0.05895); the ResNet reached 0.11386 and the MLP 0.19124 at that SNR. The
 Vanilla CNN, Inception, and DenseNet did not outperform the MLP in this
 20-epoch run. The BER curves and 12 dB
 constellation visualization are saved as
@@ -214,42 +217,102 @@ visualization and does not replace the BER metric.
 
 ### C. Accuracy and ROC-AUC comparison
 
-| Model | Mean accuracy (0–20 dB) | Mean ROC AUC (0–20 dB) | Accuracy at 12 dB | ROC AUC at 12 dB |
-|---|---:|---:|---:|---:|
-| MLPBaseline | 0.78573 | 0.86681 | 0.80810 | 0.89082 |
-| VanillaCNN1D | 0.67327 | 0.74161 | 0.68301 | 0.75478 |
-| ResNet1D | 0.83471 | 0.92294 | 0.87033 | 0.95597 |
-| Inception1D | 0.72696 | 0.82198 | 0.74261 | 0.84001 |
-| DenseNet1D | 0.66827 | 0.73427 | 0.67634 | 0.75012 |
-| DenoisingAE1D | 0.89633 | 0.94717 | 0.94340 | 0.98460 |
+#### Accuracy by SNR
 
-DenoisingAE1D ranked first in mean accuracy and mean ROC AUC over the tested
-SNR sweep. At 12 dB, it also had the highest accuracy (0.94340) and AUC
-(0.98460), followed by ResNet1D (0.87033 accuracy, 0.95597 AUC). The
-per-SNR JSON metrics support inspection of the full curves; accuracy equals
+| SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0  | 0.73399 | 0.64405 | 0.74366 | 0.69791 | 0.64105 | 0.75948 |
+| 2  | 0.74392 | 0.64928 | 0.76131 | 0.70876 | 0.64222 | 0.78902 |
+| 4  | 0.76954 | 0.67020 | 0.80353 | 0.73281 | 0.66039 | 0.83869 |
+| 6  | 0.78144 | 0.66850 | 0.83190 | 0.73359 | 0.66261 | 0.87216 |
+| 8  | 0.79007 | 0.66967 | 0.85216 | 0.73320 | 0.66366 | 0.89869 |
+| 10 | 0.79752 | 0.68536 | 0.88235 | 0.74902 | 0.67412 | 0.93098 |
+| 12 | 0.80876 | 0.68824 | 0.88614 | 0.75229 | 0.67843 | 0.94105 |
+| 14 | 0.79268 | 0.69163 | 0.89765 | 0.75464 | 0.68314 | 0.94876 |
+| 16 | 0.80902 | 0.68353 | 0.90601 | 0.75307 | 0.67255 | 0.95412 |
+| 18 | 0.80745 | 0.69529 | 0.89882 | 0.75830 | 0.68196 | 0.95268 |
+| 20 | 0.81346 | 0.68993 | 0.90327 | 0.75634 | 0.68092 | 0.95895 |
+
+#### ROC AUC by SNR
+
+| SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0  | 0.80157 | 0.70265 | 0.81076 | 0.76835 | 0.69740 | 0.82686 |
+| 2  | 0.82104 | 0.70873 | 0.84160 | 0.78477 | 0.70358 | 0.86735 |
+| 4  | 0.85006 | 0.73093 | 0.88409 | 0.80733 | 0.72276 | 0.90908 |
+| 6  | 0.86296 | 0.73872 | 0.90967 | 0.81302 | 0.73222 | 0.93945 |
+| 8  | 0.86988 | 0.73897 | 0.92815 | 0.81320 | 0.72969 | 0.95863 |
+| 10 | 0.88203 | 0.75381 | 0.94947 | 0.83255 | 0.74762 | 0.97699 |
+| 12 | 0.89083 | 0.75837 | 0.95392 | 0.83472 | 0.74921 | 0.98482 |
+| 14 | 0.87889 | 0.76316 | 0.96059 | 0.83356 | 0.75034 | 0.98598 |
+| 16 | 0.89451 | 0.75613 | 0.96224 | 0.83370 | 0.74639 | 0.98848 |
+| 18 | 0.89121 | 0.76822 | 0.96305 | 0.84025 | 0.75655 | 0.98879 |
+| 20 | 0.89209 | 0.76443 | 0.96250 | 0.83274 | 0.74996 | 0.99068 |
+
+DenoisingAE1D achieved the highest accuracy and ROC AUC at every tested SNR
+in this run. At 12 dB, its accuracy was 0.94105 and AUC was 0.98482,
+followed by ResNet1D (0.88614 accuracy, 0.95392 AUC). Accuracy equals
 \(1-\mathrm{BER}\) because both use the same binary threshold and samples.
+Unrounded per-SNR values are available in `benchmark_metrics.json`.
+
+The classic ROC curves at 12 dB, labeled with each model's AUC, and the
+per-SNR AUC curves are shown in
+[`bpsk_roc_auc_results.png`](./bpsk_roc_auc_results.png).
+
+### D. Epoch-wise training analysis
+
+All six models were trained for 20 epochs with the same training set,
+optimizer family, learning rate, and batch size. The benchmark records
+training loss, validation accuracy, and validation ROC AUC after every
+epoch in `benchmark_metrics.json`. The histories are visualized in
+[`training_epoch_analysis.png`](./training_epoch_analysis.png).
+
+| Model | Validation accuracy, epoch 1 | Validation accuracy, epoch 20 | Best validation accuracy (epoch) | Training loss, epoch 1 → 20 |
+|---|---:|---:|---:|---:|
+| MLPBaseline | 0.8025 | 0.8033 | 0.8049 (6) | 0.5421 → 0.4338 |
+| VanillaCNN1D | 0.6266 | 0.6766 | 0.6767 (17) | 0.6526 → 0.5761 |
+| ResNet1D | 0.6528 | 0.8843 | 0.8843 (20) | 0.6488 → 0.2758 |
+| Inception1D | 0.6133 | 0.7410 | 0.7426 (19) | 0.6557 → 0.5054 |
+| DenseNet1D | 0.6016 | 0.6708 | 0.6708 (20) | 0.6630 → 0.5892 |
+| DenoisingAE1D | 0.9221 | 0.9330 | 0.9366 (19) | 0.5236 → 0.2191 |
+
+Over the fixed 20 epochs, MLPBaseline was effectively at a validation
+accuracy plateau by its first epoch (best 0.8049 at epoch 6), despite its
+training loss continuing to decline. VanillaCNN1D and DenseNet1D improved
+more gradually, gaining about 5.0 and 6.9 percentage points in validation
+accuracy from epoch 1 to 20; both were still at or near their best measured
+accuracy at the end. ResNet1D showed the largest gain, from 0.6528 to
+0.8843, with lower training loss each epoch and its best validation
+accuracy at the final epoch, suggesting that this run does not show
+convergence by epoch 20. Inception1D gained about 12.8 percentage points,
+peaked at epoch 19, and dipped slightly at epoch 20. DenoisingAE1D began
+with high validation accuracy (0.9221), achieved its peak (0.9366) at epoch
+19, and reduced the composite training loss from 0.5236 to 0.2191; its
+validation performance largely plateaued late in training. These are
+single-seed observations, not a basis for changing the epoch budget without
+additional repeated-run validation.
 
 ## V. Discussion
 
-The best result was achieved by the DAE, whose BER decreased from 0.24484 at
-0 dB to 0.04118 at 20 dB. The ResNet also improved with SNR and reached
-0.11438 at 20 dB. By contrast, the MLP reached 0.18693, while the Vanilla
-CNN, Inception, and DenseNet remained above 0.25 at 20 dB. This indicates
+The best result was achieved by the DAE, whose BER decreased from 0.24052 at
+0 dB to 0.04105 at 20 dB. The ResNet also improved with SNR and reached
+0.09673 at 20 dB. By contrast, the MLP reached 0.18654, while the Vanilla
+CNN, Inception, and DenseNet remained above 0.24 at 20 dB. This indicates
 that adding convolutions alone did not guarantee improved equalization under
 the chosen architectures, pooling, training duration, and synthetic channel.
 The DAE's reconstruction objective appears beneficial here, but this single
 seed does not establish that it will generalize better in other settings.
 The ranking metrics support the same comparison: DenoisingAE1D reached
-0.99004 ROC AUC and 0.95882 accuracy at 20 dB, while ResNet1D reached
-0.96266 ROC AUC and 0.88562 accuracy. ROC AUC uses raw logits and is
+0.99068 ROC AUC and 0.95895 accuracy at 20 dB, while ResNet1D reached
+0.96250 ROC AUC and 0.90327 accuracy. ROC AUC uses raw logits and is
 threshold-independent, whereas accuracy and BER share the zero-logit
 decision threshold. High AUC with lower accuracy can indicate useful score
 ordering despite imperfect threshold calibration.
 
-The MLP was the smallest and fastest model (641 parameters; 12.228 ms per
+The MLP was the smallest and fastest model (641 parameters; 9.651 ms per
 10,000 windows). The ResNet was the largest (24,449 parameters), while
-Inception had the highest measured latency (546.000 ms); the DAE used 13,061
-parameters and 224.577 ms. These timings were measured with CPU PyTorch and
+Inception had the highest measured latency (390.541 ms); the DAE used 13,061
+parameters and 162.653 ms. These timings were measured with CPU PyTorch and
 are host-specific. They do not establish receiver deadlines for an SDR
 platform.
 
