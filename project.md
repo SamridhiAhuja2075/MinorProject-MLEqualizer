@@ -100,9 +100,9 @@ uses 200. Each burst produces 51 overlapping 16-symbol windows.
   then predicts the center bit from the reconstructed center I/Q sample.
   Its training loss combines bit-prediction loss with a reconstruction loss.
 
-The benchmark trains all models for 20 epochs with AdamW. It tests BER
-(bit-error rate: the fraction of incorrectly detected bits) at SNR values
-from 0 to 20 dB in 2 dB steps, using 150 bursts at each point.
+The benchmark trains all models for 20 epochs with AdamW. The composite
+evaluation tests SNR values from 0 to 24 dB in 2 dB steps, using 150 bursts
+at each point. That includes SNRs below and above the 5–20 dB training range.
 
 ## How to run it
 
@@ -113,11 +113,18 @@ python -m pip install torch numpy matplotlib
 python bpsk_cnn_benchmark.py
 ```
 
-The full run trains six models, so it can take a while, especially on a CPU.
-The script writes:
+The first run trains six models, so it can take a while, especially on a CPU.
+Trained weights and epoch history are saved under `checkpoints/`; later runs
+load those weights and run the evaluation suite without retraining. The script
+writes:
 
 - `benchmark_metrics.json` — parameter counts, measured inference latency,
-  configuration, and BER, accuracy, and ROC AUC at each SNR;
+  configuration, BER/FER/accuracy/ROC AUC at each SNR, calibration loss,
+  SNR gains, EVM, stress sweeps, and ablation results;
+- `bpsk_composite_evaluation.png` — BER with the theoretical AWGN reference,
+  FER, and the 12 dB constellation cleanup plot;
+- `bpsk_impairment_stress_sweeps.png` — the five fixed-15 dB stress sweeps and
+  the leave-one-out ablation chart;
 - `bpsk_cnn_benchmark_results.png` — BER curves and the denoiser's I/Q
   constellation comparison at 12 dB.
 - `bpsk_roc_auc_results.png` — ROC curves for all six models at 12 dB and
@@ -153,30 +160,141 @@ benchmark, not a guarantee of real-time performance on a radio.
 
 ## What this benchmark run found
 
-In the recorded CPU run, the denoising autoencoder had the lowest BER at
-20 dB: about **0.0411** (roughly 4 errors per 100 bits in this finite test
-set). The ResNet reached about **0.0967**, and the center-sample MLP about
-**0.1865** at the same SNR. The other three convolutional models did not
-beat the MLP in this 20-epoch run, so using a CNN did not automatically
-improve detection.
+In the recorded CPU run, DenoisingAE1D had the lowest BER at 20 dB
+(**0.0353**) and 24 dB (**0.0324**). ResNet1D was next-best at those points
+(**0.0818** and **0.0765**), while the center-sample MLP measured **0.1910**
+and **0.2067**. The DAE also had the highest mean accuracy (**90.82%**) and
+mean ROC AUC (**0.9551**) over the 13 SNR points; ResNet averaged **86.85%**
+accuracy and **0.9323** AUC. None of the models reached BER 0.02 or 0.01 by
+24 dB, so the script correctly reports the requested SNR gains as unavailable
+instead of extrapolating beyond observed data.
 
-The denoising autoencoder also ranked best by accuracy (**95.90%**) and
-ROC AUC (**0.9907**) at 20 dB. Across all 11 SNR points, its average
-accuracy was **89.50%** and average ROC AUC was **0.9470**. The JSON file
-contains the accuracy and AUC comparison for each model at every SNR.
+At 12 dB, DAE reconstruction reduced measured RMS EVM from **95.44%** on the
+raw input to **60.61%**. That is an improvement, but still leaves substantial
+distance from the ideal symbols. At 24 dB, the DAE's BER was **0.0324** but
+its FER was **0.38**: 38% of the 150 bursts still had at least one error
+among their 51 decisions.
 
-The MLP was the smallest and fastest model in this run: **641 parameters**
-and about **9.7 ms per 10,000 windows**. The DAE used **13,061 parameters**
-and about **162.7 ms per 10,000 windows**. These measurements depend on the
-host computer and synthetic setup; the technical table in
-[`research_paper.md`](./research_paper.md) summarizes accuracy and ROC AUC
-alongside the BER tables; the JSON includes their values at every SNR.
+The MLP was the smallest and fastest model in this run: **641 parameters**,
+**2.50 KB** of FP32 weights, and about **7.69 ms per 10,000 windows**. The
+DAE used **13,061 parameters**, **51.02 KB**, and about **108.10 ms** per
+10,000 windows. In the 15 dB leave-one-out study, removing multipath caused
+the largest BER reduction for every model; for example, DAE BER changed from
+**0.0392** with all impairments to **0.0073** without multipath. This is a
+result of this synthetic setup and one randomized run, not a universal
+ranking of real-world channel problems.
 
-All models receive 20 training epochs. In this run, ResNet accuracy
-continued to improve through epoch 20, while the MLP and autoencoder were
-near their best validation accuracy earlier. See
+See
 [`training_epoch_analysis.png`](./training_epoch_analysis.png) and the
 epoch-by-epoch `training_history` in the metrics JSON for all six models.
+
+## What every evaluation measures (plain-English guide)
+
+The evaluations reuse the same six already-trained models. Except when an
+ablation explicitly disables one effect, the ten impairment categories stay
+active together. SNR sets the thermal background-noise level; it does not turn
+the other distortions on or off. The stress tests hold thermal SNR at 15 dB
+while deliberately changing one impairment parameter.
+
+### Signal and error metrics
+
+- **BER (bit-error rate):** Count the wrongly guessed center bits and divide
+  by all tested bits. A BER of `0.01` means about 10 wrong bits per 1,000
+  decisions. Smaller is better. On a log plot, a one-decade drop is ten times
+  fewer errors.
+- **SNR:** The signal-to-thermal-noise ratio. A higher SNR is like making the
+  wanted voice louder compared with steady background hiss. It only controls
+  the AWGN power in this simulator; echoes, interference, phase changes,
+  amplifier distortion, and receiver imbalance remain separate effects.
+- **SNR gain (ΔSNR):** The script estimates how much SNR each model needs to
+  reach BER `0.02` and `0.01`, interpolating between measured sweep points on
+  a logarithmic BER scale. Gain is `MLP required SNR - model required SNR`:
+  a positive number means the model reaches the same error rate with a
+  quieter signal than the MLP. A `null` value means the measured curve never
+  crossed that target, so the benchmark cannot claim a gain.
+- **Theoretical uncoded BPSK AWGN curve:** The dashed reference is the
+  textbook BPSK error rate in pure Gaussian hiss with no other impairments.
+  Think of it as a physics comparison line for a much cleaner channel, not a
+  promised result or a strict limit for the simulator that also has hardware
+  and propagation effects.
+- **Error floor:** The JSON reports the exact observed BER at 20 dB and
+  24 dB. If the error rate stops dropping in this quiet regime, non-AWGN
+  distortions or the model may be limiting performance. Finite tests can
+  have zero errors; zero here means none were observed in the tested sample,
+  not that errors are impossible.
+- **FER (frame error rate):** Each 66-symbol burst yields 51 overlapping
+  center-bit decisions. A burst is counted as a failed frame if even one of
+  its 51 decisions is wrong. It is like asking whether a 51-letter sentence
+  arrived with no typos at all. FER is therefore usually higher than BER.
+- **Soft-decision BCE loss at 10 dB:** Binary cross-entropy scores the
+  confidence of each predicted probability as well as whether its final
+  decision was right. A confidently wrong answer is penalized more than a
+  cautious one. Lower BCE means better probability estimates on that test
+  set; it is a useful confidence/calibration indicator, though it is not a
+  full calibration plot.
+- **OOD SNR generalization:** The models practice on SNRs from 5 to 20 dB.
+  The 0–4 dB points are harsher than practice, and 22–24 dB are cleaner than
+  practice. These out-of-distribution points show whether the learned rule
+  still works outside the range it saw during training.
+- **RMS EVM (error vector magnitude):** At 12 dB, compare each received or
+  reconstructed I/Q point with the ideal transmitted BPSK point and express
+  the RMS distance as a percentage of ideal signal size. Picture darts
+  scattered around two bullseyes: lower EVM means a tighter cluster. The
+  JSON gives raw-input and DAE-reconstruction values; EVM is not itself BER.
+
+### Stress sweeps and ablation study
+
+All five stress sweeps keep AWGN at 15 dB and leave the other impairment
+categories at their normal randomized settings. The horizontal axis changes
+one parameter at a time; each colored curve is one model. Higher BER means
+that condition is harder for that model.
+
+- **CFO sweep:** Carrier-frequency offset is a mismatch between the radio
+  clocks, causing the signal's angle to keep rotating. Larger normalized
+  offsets imitate increasingly misaligned clocks.
+- **Doppler sweep:** Doppler measures how quickly the channel changes with
+  motion. Larger normalized Doppler can represent faster relative movement,
+  such as a vehicle passing through changing reflections.
+- **CCI/ACI SIR sweep:** Signal-to-interference ratio compares the wanted
+  transmission with another QPSK transmitter. Smaller SIR means louder
+  neighboring-channel chatter (like competing Wi-Fi/Bluetooth-like signals)
+  and is harder; larger SIR means the interferer is quieter.
+- **Impulsive-noise probability sweep:** This changes how often short,
+  powerful voltage spikes occur, like clicks from electrical switching or
+  motor sparks. The plotted probability is the chance per sample.
+- **PA drive sweep:** The drive gain controls how hard the transmitter
+  amplifier is pushed. At higher drive it operates further into compression
+  and phase distortion, similar to turning an audio amplifier up until peaks
+  become flattened.
+- **Leave-one-out ablation:** First run a baseline with all ten impairment
+  categories active, then run ten more cases, each with exactly one
+  impairment category switched off. If BER falls a lot when one is removed,
+  that category was especially harmful in that particular model and mixture.
+  This is a controlled comparison, not proof that the effect is equally
+  harmful in every real radio.
+
+### Hardware size and speed
+
+- **Trainable parameters:** The number of learned numerical values in a
+  network—roughly its brain size. Fewer values generally mean a smaller
+  model, but do not by themselves guarantee better accuracy or speed.
+- **FP32 weight footprint (KB):** The storage required for the learned
+  weights when each value uses 32 bits. It does not include runtime buffers,
+  Python/PyTorch overhead, or the training optimizer.
+- **MACs and FLOPs per symbol:** A multiply-accumulate (MAC) is one
+  multiplication combined with an addition. The script counts MACs in
+  `Conv1d`, `ConvTranspose1d`, and `Linear` layers using PyTorch forward
+  hooks for one 16-sample window; FLOPs are reported as twice the MAC count.
+  These operation counts omit work in activation, normalization, pooling,
+  and other operations, so treat them as comparable estimates rather than a
+  complete hardware instruction count.
+- **Inference latency:** The measured wall-clock milliseconds needed to
+  process exactly 10,000 windows, in batches of 256, on the selected CPU or
+  GPU. It is machine-dependent and is not a guarantee of real-time radio
+  performance.
+- **Throughput:** The corresponding measured number of center-symbol
+  windows processed per second (`10,000 / elapsed seconds`). It is the
+  reciprocal view of latency; higher is faster on the measured machine.
 
 ## How training changes over epochs
 

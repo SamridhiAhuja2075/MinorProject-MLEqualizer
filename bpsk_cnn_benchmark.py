@@ -37,13 +37,21 @@ class BenchmarkConfig:
     batch_size: int = 256
     learning_rate: float = 1e-3
     train_snr_db: tuple[float, float] = (5.0, 20.0)
-    snr_sweep_db: tuple[int, ...] = tuple(range(0, 21, 2))
+    snr_sweep_db: tuple[int, ...] = tuple(range(0, 25, 2))
     sweep_bursts: int = 150
+    stress_bursts: int = 150
+    ablation_bursts: int = 150
     burst_noise_probability: float = 0.025
     pulse_taps: tuple[float, ...] = (0.08, 0.84, 0.08)
     channel_power_profile: tuple[float, ...] = (0.75, 0.18, 0.07)
     isi_power_profile: tuple[float, ...] = (0.75, 0.18, 0.07)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+IMPAIRMENT_NAMES = (
+    "pa", "multipath", "isi", "doppler", "awgn",
+    "impulsive", "cci_aci", "cfo", "phase_noise", "iq_dc",
+)
 
 
 class WirelessChannelSimulator:
@@ -53,7 +61,9 @@ class WirelessChannelSimulator:
         self.config = config
         self.rng = np.random.default_rng(config.seed if seed is None else seed)
 
-    def _fading_taps(self, sample_count: int) -> NDArray[np.complex128]:
+    def _fading_taps(
+        self, sample_count: int, normalized_doppler: float | None = None
+    ) -> NDArray[np.complex128]:
         """Create three correlated, phase-coherent Rayleigh/Rician paths."""
         path_power = np.asarray(self.config.channel_power_profile, dtype=np.float64)
         path_power /= path_power.sum()
@@ -81,7 +91,11 @@ class WirelessChannelSimulator:
             taps *= phase_correction
             mean_taps *= phase_correction
 
-        fd_times_ts = self.rng.uniform(0.0, 0.04)
+        fd_times_ts = (
+            float(normalized_doppler)
+            if normalized_doppler is not None
+            else float(self.rng.uniform(0.0, 0.04))
+        )
         rho = _j0(2.0 * math.pi * fd_times_ts)
         rho = float(np.clip(rho, -0.999, 0.999))
         innovation_scale = math.sqrt(max(0.0, 1.0 - rho * rho))
@@ -95,10 +109,31 @@ class WirelessChannelSimulator:
             sequence[index] = state
         return sequence
 
-    def _one_burst(
-        self, snr_db: float
+    def generate_burst(
+        self,
+        snr_db: float,
+        *,
+        disabled_impairment: str | None = None,
+        override_cfo: float | None = None,
+        override_doppler: float | None = None,
+        override_sir_db: float | None = None,
+        override_imp_prob: float | None = None,
+        override_pa_drive: float | None = None,
     ) -> tuple[NDArray[np.complex128], NDArray[np.float32]]:
         cfg = self.config
+        if disabled_impairment is not None and disabled_impairment not in IMPAIRMENT_NAMES:
+            raise ValueError(f"Unknown impairment {disabled_impairment!r}.")
+        if override_imp_prob is not None and not 0.0 <= override_imp_prob <= 1.0:
+            raise ValueError("override_imp_prob must be in [0, 1].")
+        if override_pa_drive is not None and override_pa_drive < 0:
+            raise ValueError("override_pa_drive cannot be negative.")
+        if override_doppler is not None and override_doppler < 0:
+            raise ValueError("override_doppler cannot be negative.")
+        if any(
+            value is not None and not math.isfinite(value)
+            for value in (override_cfo, override_doppler, override_sir_db, override_imp_prob, override_pa_drive)
+        ):
+            raise ValueError("Override values must be finite.")
         bits = self.rng.integers(0, 2, size=cfg.burst_len).astype(np.float32)
         symbols = (2.0 * bits - 1.0).astype(np.complex128)
 
@@ -107,80 +142,111 @@ class WirelessChannelSimulator:
         pulse = np.asarray(cfg.pulse_taps, dtype=np.float64)
         pulse /= pulse.sum()
         shaped = np.convolve(symbols, pulse, mode="same")
-        amplitude = np.abs(shaped)
-        phase = np.angle(shaped)
-        alpha_a, beta_a = 2.1587, 1.1517
-        alpha_phi, beta_phi = 4.0033, 9.1040
-        am_am = alpha_a * amplitude / (1.0 + beta_a * amplitude**2)
-        am_pm = alpha_phi * amplitude**2 / (1.0 + beta_phi * amplitude**2)
-        transmitted = am_am * np.exp(1j * (phase + am_pm))
+        if disabled_impairment == "pa":
+            transmitted = symbols
+        else:
+            pa_drive = override_pa_drive if override_pa_drive is not None else self.rng.uniform(0.9, 1.5)
+            driven = shaped * pa_drive
+            amplitude = np.abs(driven)
+            phase = np.angle(driven)
+            alpha_a, beta_a = 2.1587, 1.1517
+            alpha_phi, beta_phi = 4.0033, 9.1040
+            am_am = alpha_a * amplitude / (1.0 + beta_a * amplitude**2)
+            am_pm = alpha_phi * amplitude**2 / (1.0 + beta_phi * amplitude**2)
+            transmitted = am_am * np.exp(1j * (phase + am_pm))
 
         # 2, 3, 4. Time-varying three-path Rayleigh/Rician fading, delayed
         # multipath echoes (ISI), and AR(1) Doppler evolution.
-        fading = self._fading_taps(cfg.burst_len)
+        fading = self._fading_taps(cfg.burst_len, override_doppler)
         tracked_fading = fading * np.exp(-1j * np.angle(fading[:, :1]))
+        if disabled_impairment == "multipath":
+            tracked_fading[:] = 0.0
+            tracked_fading[:, 0] = 1.0
+        if disabled_impairment == "doppler":
+            tracked_fading[:] = tracked_fading[0]
         channel = np.zeros(cfg.burst_len, dtype=np.complex128)
         for delay in range(3):
             channel[delay:] += (
                 tracked_fading[delay:, delay] * transmitted[: cfg.burst_len - delay]
             )
-        isi_taps = np.sqrt(np.asarray(cfg.isi_power_profile, dtype=np.float64))
+        isi_taps = (
+            np.asarray([1.0])
+            if disabled_impairment == "isi"
+            else np.sqrt(np.asarray(cfg.isi_power_profile, dtype=np.float64))
+        )
         channel = np.convolve(channel, isi_taps, mode="full")[: cfg.burst_len]
 
         signal_power = float(np.mean(np.abs(channel) ** 2) + 1e-12)
         thermal_power = signal_power / (10.0 ** (snr_db / 10.0))
 
         # 5. Complex AWGN calibrated to the requested burst SNR.
-        awgn = (
-            self.rng.normal(size=cfg.burst_len)
-            + 1j * self.rng.normal(size=cfg.burst_len)
-        ) * math.sqrt(thermal_power / 2.0)
+        if disabled_impairment == "awgn":
+            awgn = np.zeros(cfg.burst_len, dtype=np.complex128)
+        else:
+            awgn = (
+                self.rng.normal(size=cfg.burst_len)
+                + 1j * self.rng.normal(size=cfg.burst_len)
+            ) * math.sqrt(thermal_power / 2.0)
         received = channel + awgn
 
         # 6. Sparse Bernoulli-Gaussian impulsive/burst noise.
-        spike_mask = self.rng.random(cfg.burst_len) < cfg.burst_noise_probability
-        spike_power = thermal_power * self.rng.uniform(5.0, 10.0)
-        spikes = (
-            self.rng.normal(size=cfg.burst_len)
-            + 1j * self.rng.normal(size=cfg.burst_len)
-        ) * math.sqrt(spike_power / 2.0)
-        received += spike_mask * spikes
+        if disabled_impairment != "impulsive":
+            imp_prob = (
+                override_imp_prob
+                if override_imp_prob is not None
+                else cfg.burst_noise_probability
+            )
+            spike_mask = self.rng.random(cfg.burst_len) < imp_prob
+            spike_power = thermal_power * self.rng.uniform(5.0, 10.0)
+            spikes = (
+                self.rng.normal(size=cfg.burst_len)
+                + 1j * self.rng.normal(size=cfg.burst_len)
+            ) * math.sqrt(spike_power / 2.0)
+            received += spike_mask * spikes
 
         # 7. QPSK co-channel or frequency-offset adjacent-channel interferer.
-        interference_bits = self.rng.integers(0, 4, size=cfg.burst_len)
-        qpsk = np.exp(1j * (math.pi / 4.0 + interference_bits * math.pi / 2.0))
-        sir_db = self.rng.uniform(10.0, 25.0)
-        interference_power = signal_power / (10.0 ** (sir_db / 10.0))
-        if self.rng.random() < 0.5:
-            offset = self.rng.uniform(-0.02, 0.02)
-        else:
-            offset = self.rng.choice((-1.0, 1.0)) * self.rng.uniform(0.1, 0.25)
         n = np.arange(cfg.burst_len)
-        interferer = qpsk * np.exp(2j * math.pi * offset * n)
-        received += interferer * math.sqrt(interference_power)
+        if disabled_impairment != "cci_aci":
+            interference_bits = self.rng.integers(0, 4, size=cfg.burst_len)
+            qpsk = np.exp(1j * (math.pi / 4.0 + interference_bits * math.pi / 2.0))
+            sir_db = (
+                override_sir_db
+                if override_sir_db is not None
+                else self.rng.uniform(10.0, 25.0)
+            )
+            interference_power = signal_power / (10.0 ** (sir_db / 10.0))
+            if self.rng.random() < 0.5:
+                offset = self.rng.uniform(-0.02, 0.02)
+            else:
+                offset = self.rng.choice((-1.0, 1.0)) * self.rng.uniform(0.1, 0.25)
+            interferer = qpsk * np.exp(2j * math.pi * offset * n)
+            received += interferer * math.sqrt(interference_power)
 
         # 8. Carrier-frequency offset, in cycles per symbol.
-        cfo = self.rng.uniform(-0.001, 0.001)
-        received *= np.exp(2j * math.pi * cfo * n)
+        if disabled_impairment != "cfo":
+            cfo = override_cfo if override_cfo is not None else self.rng.uniform(-0.001, 0.001)
+            received *= np.exp(2j * math.pi * cfo * n)
 
         # 9. Cumulative Wiener phase noise.
-        phase_step_std = self.rng.uniform(0.01, 0.05)
-        phase_walk = np.cumsum(self.rng.normal(0.0, phase_step_std, cfg.burst_len))
-        received *= np.exp(1j * phase_walk)
+        if disabled_impairment != "phase_noise":
+            phase_step_std = self.rng.uniform(0.01, 0.05)
+            phase_walk = np.cumsum(self.rng.normal(0.0, phase_step_std, cfg.burst_len))
+            received *= np.exp(1j * phase_walk)
 
         # 10. Receiver gain/phase imbalance and independent DC offsets.
-        gain_i = 1.0 + self.rng.uniform(-0.15, 0.15)
-        gain_q = 1.0 + self.rng.uniform(-0.15, 0.15)
-        skew = math.radians(self.rng.uniform(-10.0, 10.0))
-        i_values = received.real * gain_i
-        q_values = received.imag * gain_q
-        i_imbalanced = i_values * math.cos(skew / 2.0) + q_values * math.sin(skew / 2.0)
-        q_imbalanced = q_values * math.cos(skew / 2.0) + i_values * math.sin(skew / 2.0)
-        received = (
-            i_imbalanced
-            + self.rng.uniform(-0.15, 0.15)
-            + 1j * (q_imbalanced + self.rng.uniform(-0.15, 0.15))
-        )
+        if disabled_impairment != "iq_dc":
+            gain_i = 1.0 + self.rng.uniform(-0.15, 0.15)
+            gain_q = 1.0 + self.rng.uniform(-0.15, 0.15)
+            skew = math.radians(self.rng.uniform(-10.0, 10.0))
+            i_values = received.real * gain_i
+            q_values = received.imag * gain_q
+            i_imbalanced = i_values * math.cos(skew / 2.0) + q_values * math.sin(skew / 2.0)
+            q_imbalanced = q_values * math.cos(skew / 2.0) + i_values * math.sin(skew / 2.0)
+            received = (
+                i_imbalanced
+                + self.rng.uniform(-0.15, 0.15)
+                + 1j * (q_imbalanced + self.rng.uniform(-0.15, 0.15))
+            )
         return received, bits
 
     def generate(
@@ -188,6 +254,13 @@ class WirelessChannelSimulator:
         burst_count: int,
         snr_db: float | None = None,
         snr_range: tuple[float, float] | None = None,
+        *,
+        disabled_impairment: str | None = None,
+        override_cfo: float | None = None,
+        override_doppler: float | None = None,
+        override_sir_db: float | None = None,
+        override_imp_prob: float | None = None,
+        override_pa_drive: float | None = None,
     ) -> tuple[FloatArray, FloatArray, FloatArray]:
         """Return AGC-normalized windows, center-bit labels, and clean windows."""
         cfg = self.config
@@ -200,7 +273,15 @@ class WirelessChannelSimulator:
                 if snr_range is not None
                 else float(snr_db if snr_db is not None else cfg.train_snr_db[0])
             )
-            received, bits = self._one_burst(current_snr)
+            received, bits = self.generate_burst(
+                current_snr,
+                disabled_impairment=disabled_impairment,
+                override_cfo=override_cfo,
+                override_doppler=override_doppler,
+                override_sir_db=override_sir_db,
+                override_imp_prob=override_imp_prob,
+                override_pa_drive=override_pa_drive,
+            )
             iq = np.stack((received.real, received.imag), axis=0).astype(np.float32)
             windows = np.lib.stride_tricks.sliding_window_view(
                 iq, cfg.window_len, axis=1
@@ -220,6 +301,32 @@ class WirelessChannelSimulator:
             np.concatenate(all_windows).astype(np.float32),
             np.concatenate(all_labels).astype(np.float32)[:, None],
             np.concatenate(all_clean).astype(np.float32),
+        )
+
+    def build_dataset(
+        self,
+        burst_count: int,
+        snr_db: float | None = None,
+        snr_range: tuple[float, float] | None = None,
+        *,
+        disabled_impairment: str | None = None,
+        override_cfo: float | None = None,
+        override_doppler: float | None = None,
+        override_sir_db: float | None = None,
+        override_imp_prob: float | None = None,
+        override_pa_drive: float | None = None,
+    ) -> tuple[FloatArray, FloatArray, FloatArray]:
+        """Build window arrays while preserving fixed contiguous burst ordering."""
+        return self.generate(
+            burst_count,
+            snr_db,
+            snr_range,
+            disabled_impairment=disabled_impairment,
+            override_cfo=override_cfo,
+            override_doppler=override_doppler,
+            override_sir_db=override_sir_db,
+            override_imp_prob=override_imp_prob,
+            override_pa_drive=override_pa_drive,
         )
 
 
@@ -553,9 +660,94 @@ def _loader(
 
 
 @torch.inference_mode()
+def _evaluation_outputs(
+    model: nn.Module, arrays: tuple[FloatArray, FloatArray, FloatArray], device: str
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], float]:
+    """Collect logits, labels, and mean BCE for a generated data set."""
+    model.eval()
+    logits_parts: list[NDArray[np.float64]] = []
+    labels_parts: list[NDArray[np.bool_]] = []
+    bce = nn.BCEWithLogitsLoss(reduction="sum")
+    total_loss = 0.0
+    inputs, labels = arrays[0], arrays[1]
+    for start in range(0, len(inputs), 1024):
+        x = torch.from_numpy(inputs[start : start + 1024]).to(device)
+        y = torch.from_numpy(labels[start : start + 1024]).to(device)
+        scores = _logits(model, x)
+        total_loss += float(bce(scores, y).item())
+        logits_parts.append(scores.squeeze(1).cpu().numpy().astype(np.float64, copy=False))
+        labels_parts.append(y.squeeze(1).cpu().numpy() >= 0.5)
+    return np.concatenate(logits_parts), np.concatenate(labels_parts), total_loss / len(inputs)
+
+
+def _frame_error_rate(
+    logits: NDArray[np.float64],
+    labels: NDArray[np.bool_],
+    bursts: int,
+    windows_per_burst: int,
+) -> float:
+    errors = (logits >= 0.0) != labels
+    grouped = errors.reshape(bursts, windows_per_burst)
+    return float(np.mean(np.any(grouped, axis=1)))
+
+
+def _snr_at_ber(
+    snrs: tuple[int, ...], ber_by_snr: dict[str, float], target: float
+) -> float | None:
+    points = [(float(snr), max(float(ber_by_snr[str(snr)]), 1e-12)) for snr in snrs]
+    points.sort(key=lambda point: point[0])
+    for (snr_a, ber_a), (snr_b, ber_b) in zip(points, points[1:]):
+        if (ber_a - target) * (ber_b - target) <= 0.0 and ber_a != ber_b:
+            log_a, log_b = math.log10(ber_a), math.log10(ber_b)
+            fraction = (math.log10(target) - log_a) / (log_b - log_a)
+            return snr_a + fraction * (snr_b - snr_a)
+    return None
+
+
+def _profile_operations(
+    model: nn.Module, device: str, input_shape: tuple[int, int, int] = (1, 2, 16)
+) -> int:
+    """Count Conv1d, ConvTranspose1d, and Linear MACs per decoded window."""
+    mac_count = 0
+    handles = []
+
+    def count_layer(module: nn.Module, _args: tuple[Tensor, ...], output: Tensor) -> None:
+        nonlocal mac_count
+        del _args
+        if isinstance(module, nn.Linear):
+            mac_count += int(output.numel() * module.in_features)
+        elif isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
+            kernel_size = int(np.prod(module.kernel_size))
+            if isinstance(module, nn.Conv1d):
+                mac_count += int(
+                    output.numel() * (module.in_channels // module.groups) * kernel_size
+                )
+            else:
+                mac_count += int(
+                    output.numel() * (module.in_channels // module.groups) * kernel_size
+                )
+
+    for layer in model.modules():
+        if isinstance(layer, (nn.Conv1d, nn.ConvTranspose1d, nn.Linear)):
+            handles.append(layer.register_forward_hook(count_layer))
+    try:
+        model.eval()
+        with torch.inference_mode():
+            _logits(model, torch.zeros(input_shape, dtype=torch.float32, device=device))
+    finally:
+        for handle in handles:
+            handle.remove()
+    return mac_count
+
+
+@torch.inference_mode()
 def _latency_ms_per_10k(model: nn.Module, inputs: FloatArray, device: str) -> float:
     model.eval()
-    sample = torch.from_numpy(inputs[:10_000]).to(device)
+    if len(inputs) == 0:
+        raise ValueError("Latency profiling requires at least one input window.")
+    repeats = math.ceil(10_000 / len(inputs))
+    repeated = np.tile(inputs, (repeats, 1, 1))[:10_000]
+    sample = torch.from_numpy(repeated).to(device)
     batch_size = 256
     for offset in range(0, min(len(sample), batch_size), batch_size):
         _logits(model, sample[offset : offset + batch_size])
@@ -688,6 +880,108 @@ def _save_epoch_figure(
     plt.close(figure)
 
 
+def _save_composite_figure(
+    ber: dict[str, dict[str, float]],
+    fer: dict[str, dict[str, float]],
+    snrs: tuple[int, ...],
+    awgn_ber: dict[str, float],
+    constellation_inputs: FloatArray,
+    autoencoder: DenoisingAE1D,
+    evm: dict[str, float],
+    config: BenchmarkConfig,
+) -> None:
+    figure, axes = plt.subplots(1, 3, figsize=(19, 5.5))
+    floor = 1.0 / (config.sweep_bursts * (config.burst_len - config.window_len + 1))
+    axes[0].axvspan(0, 4, color="tab:red", alpha=0.08, label="Low-SNR OOD")
+    axes[0].axvspan(5, 20, color="tab:green", alpha=0.06, label="Training range")
+    axes[0].axvspan(22, 24, color="tab:orange", alpha=0.08, label="High-SNR OOD")
+    for model_name, values in ber.items():
+        axes[0].semilogy(
+            snrs, [max(values[str(snr)], floor) for snr in snrs], marker="o", label=model_name
+        )
+    axes[0].semilogy(snrs, [max(awgn_ber[str(snr)], floor) for snr in snrs], "k--", label="BPSK AWGN theory")
+    axes[0].set(title="BER versus SNR", xlabel="SNR (dB)", ylabel="BER")
+    axes[0].grid(True, which="both", alpha=0.3)
+    axes[0].legend(fontsize=7)
+
+    for model_name, values in fer.items():
+        axes[1].plot(snrs, [values[str(snr)] for snr in snrs], marker="o", label=model_name)
+    axes[1].set(title="Frame error rate (51 decisions)", xlabel="SNR (dB)", ylabel="FER")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=7)
+
+    count = min(2500, len(constellation_inputs))
+    sample = constellation_inputs[:count]
+    reconstructed = _reconstruct(autoencoder, sample, config.device)
+    raw_center = sample[:, :, 8]
+    denoised_center = reconstructed[:, :, 8]
+    axes[2].scatter(raw_center[:, 0], raw_center[:, 1], s=7, alpha=0.2, label="Raw impaired")
+    axes[2].scatter(denoised_center[:, 0], denoised_center[:, 1], s=7, alpha=0.3, label="DAE reconstruction")
+    axes[2].scatter([-1, 1], [0, 0], marker="x", s=70, color="black", label="Ideal BPSK")
+    axes[2].set(
+        title=f"12 dB constellation cleanup (EVM {evm['raw_percent']:.1f}% → {evm['dae_percent']:.1f}%)",
+        xlabel="In-phase (I)", ylabel="Quadrature (Q)",
+    )
+    axes[2].axis("equal")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend(fontsize=7)
+    figure.tight_layout()
+    figure.savefig("bpsk_composite_evaluation.png", dpi=180)
+    plt.close(figure)
+
+
+def _save_stress_figure(
+    stress: dict[str, dict[str, object]],
+    ablation: dict[str, dict[str, float]],
+) -> None:
+    figure, axes = plt.subplots(2, 3, figsize=(18, 10))
+    for axis, (sweep_name, sweep) in zip(axes.flat[:5], stress.items()):
+        x_values = sweep["values"]
+        model_results = sweep["ber"]
+        for model_name, values in model_results.items():
+            axis.plot(x_values, values, marker="o", label=model_name)
+        axis.set(title=sweep_name.replace("_", " "), xlabel=sweep["x_label"], ylabel="BER")
+        axis.grid(True, alpha=0.3)
+    axes.flat[4].legend(fontsize=7)
+    cases = list(ablation)
+    x = np.arange(len(cases))
+    width = 0.8 / len(MODEL_FACTORIES)
+    for index, model_name in enumerate(MODEL_FACTORIES):
+        axes.flat[5].bar(
+            x + index * width,
+            [ablation[case][model_name] for case in cases],
+            width,
+            label=model_name,
+        )
+    axes.flat[5].set(
+        title="Leave-one-out impairment ablation",
+        xlabel="Disabled impairment (or all active)",
+        ylabel="BER at 15 dB",
+        xticks=x + width * (len(MODEL_FACTORIES) - 1) / 2,
+        xticklabels=cases,
+    )
+    axes.flat[5].tick_params(axis="x", labelrotation=55)
+    axes.flat[5].grid(True, axis="y", alpha=0.3)
+    axes.flat[5].legend(fontsize=6)
+    figure.tight_layout()
+    figure.savefig("bpsk_impairment_stress_sweeps.png", dpi=180)
+    plt.close(figure)
+
+
+def _load_checkpoint(path: Path, model: nn.Module, device: str) -> dict[str, list[float]] | None:
+    if not path.exists():
+        return None
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["state_dict"])
+    return checkpoint.get("training_history")
+
+
+def _save_checkpoint(
+    path: Path, model: nn.Module, history: dict[str, list[float]]
+) -> None:
+    torch.save({"state_dict": model.state_dict(), "training_history": history}, path)
+
+
 def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
     config = config or BenchmarkConfig()
     random.seed(config.seed)
@@ -696,7 +990,9 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
     if config.device.startswith("cuda"):
         torch.cuda.manual_seed_all(config.seed)
 
-    print(f"Device: {config.device}; generating burst datasets...", flush=True)
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Device: {config.device}; generating training and validation bursts...", flush=True)
     train_arrays = WirelessChannelSimulator(config, config.seed).generate(
         config.train_bursts, snr_range=config.train_snr_db
     )
@@ -705,99 +1001,203 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
     )
     train_loader = _loader(train_arrays, config.batch_size, shuffle=True)
     validation_loader = _loader(validation_arrays, 1024)
-    print(
-        f"Windows: train={len(train_arrays[0])}, validation={len(validation_arrays[0])}; "
-        f"training {config.epochs} epochs per model",
-        flush=True,
-    )
-
     models: dict[str, nn.Module] = {}
     complexity: dict[str, dict[str, float | int]] = {}
     training_history: dict[str, dict[str, list[float]]] = {}
     for name, factory in MODEL_FACTORIES.items():
         torch.manual_seed(config.seed)
-        model = factory()
-        parameter_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-        print(f"\nTraining {name} ({parameter_count:,} trainable parameters)", flush=True)
-        training_history[name] = _train_one(
-            model, train_loader, validation_loader, config
-        )
+        model = factory().to(config.device)
+        checkpoint = checkpoint_dir / f"{name}.pt"
+        history = _load_checkpoint(checkpoint, model, config.device)
+        if not checkpoint.exists():
+            print(f"\nTraining {name}...", flush=True)
+            history = _train_one(model, train_loader, validation_loader, config)
+            _save_checkpoint(checkpoint, model, history)
+        else:
+            print(f"\nLoaded checkpoint for {name}: {checkpoint}", flush=True)
+            if history is None:
+                history = {"training_loss": [], "validation_accuracy": [], "validation_roc_auc": []}
         models[name] = model
-        complexity[name] = {"trainable_parameters": parameter_count}
+        training_history[name] = history
+        complexity[name] = {
+            "trainable_parameters": sum(
+                parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            ),
+            "weight_footprint_kb_fp32": sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in model.parameters()
+            ) / 1024.0,
+        }
 
-    sweep_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
-    accuracy_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
-    roc_auc_results: dict[str, dict[str, float]] = {name: {} for name in MODEL_FACTORIES}
-    roc_at_12_db: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
-    constellation_inputs: FloatArray | None = None
+    ber_results = {name: {} for name in MODEL_FACTORIES}
+    accuracy_results = {name: {} for name in MODEL_FACTORIES}
+    auc_results = {name: {} for name in MODEL_FACTORIES}
+    fer_results = {name: {} for name in MODEL_FACTORIES}
+    test_bce: dict[str, float] = {}
+    roc_at_12: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
+    data_at_12: tuple[FloatArray, FloatArray, FloatArray] | None = None
     for snr in config.snr_sweep_db:
-        print(f"\nEvaluating SNR {snr} dB...", flush=True)
+        print(f"Composite evaluation: SNR {snr} dB", flush=True)
         arrays = WirelessChannelSimulator(config, config.seed + 1000 + snr).generate(
             config.sweep_bursts, snr_db=float(snr)
         )
-        loader = _loader(arrays, 1024)
-        for name, model in models.items():
-            scores, labels = _classification_scores(model, loader, config.device)
-            accuracy = float(np.mean((scores >= 0.0) == labels))
-            roc_auc = _roc_auc(labels, scores)
-            accuracy_results[name][str(snr)] = accuracy
-            sweep_results[name][str(snr)] = 1.0 - accuracy
-            roc_auc_results[name][str(snr)] = roc_auc
-            if snr == 12:
-                roc_at_12_db[name] = _roc_curve_points(labels, scores)
         if snr == 12:
-            constellation_inputs = arrays[0]
+            data_at_12 = arrays
+        for name, model in models.items():
+            logits, labels, mean_bce = _evaluation_outputs(model, arrays, config.device)
+            key = str(snr)
+            ber_results[name][key] = float(np.mean((logits >= 0.0) != labels))
+            accuracy_results[name][key] = float(np.mean((logits >= 0.0) == labels))
+            auc_results[name][key] = _roc_auc(labels, logits)
+            fer_results[name][key] = _frame_error_rate(
+                logits, labels, config.sweep_bursts, config.burst_len - config.window_len + 1
+            )
+            if snr == 10:
+                test_bce[name] = mean_bce
+            if snr == 12:
+                roc_at_12[name] = _roc_curve_points(labels, logits)
 
-    if constellation_inputs is None:
-        constellation_inputs, _, _ = WirelessChannelSimulator(config, config.seed + 1012).generate(
-            config.sweep_bursts, snr_db=12.0
-        )
-
-    latency_inputs = validation_arrays[0]
-    for name, model in models.items():
-        complexity[name]["latency_ms_per_10000_windows"] = _latency_ms_per_10k(
-            model, latency_inputs, config.device
-        )
-
+    if data_at_12 is None:
+        raise RuntimeError("The configured SNR sweep must include 12 dB for EVM evaluation.")
+    inputs_12, _, clean_12 = data_at_12
     autoencoder = models["DenoisingAE1D"]
     if not isinstance(autoencoder, DenoisingAE1D):
         raise TypeError("DenoisingAE1D factory returned an unexpected model type.")
-    _save_figure(
-        sweep_results,
-        config.snr_sweep_db,
-        constellation_inputs,
-        autoencoder,
-        config,
+    reconstructed_12 = _reconstruct(autoencoder, inputs_12, config.device)
+    ideal_center = clean_12[:, :, config.window_len // 2]
+    raw_center = inputs_12[:, :, config.window_len // 2]
+    reconstructed_center = reconstructed_12[:, :, config.window_len // 2]
+    reference_power = float(np.sum(ideal_center**2)) + 1e-12
+    evm = {
+        "raw_percent": float(100.0 * math.sqrt(float(np.sum((raw_center - ideal_center) ** 2)) / reference_power)),
+        "dae_percent": float(100.0 * math.sqrt(float(np.sum((reconstructed_center - ideal_center) ** 2)) / reference_power)),
+    }
+
+    target_ber = (0.02, 0.01)
+    snr_required = {
+        name: {str(target): _snr_at_ber(config.snr_sweep_db, values, target) for target in target_ber}
+        for name, values in ber_results.items()
+    }
+    snr_gain: dict[str, dict[str, float | None]] = {}
+    for name, values in snr_required.items():
+        snr_gain[name] = {}
+        for target in target_ber:
+            baseline = snr_required["MLPBaseline"][str(target)]
+            current = values[str(target)]
+            snr_gain[name][str(target)] = (
+                None if baseline is None or current is None else float(baseline - current)
+            )
+
+    stress_specs: tuple[tuple[str, tuple[float, ...], str, str], ...] = (
+        ("cfo", (0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03), "override_cfo", "Normalized CFO (cycles/symbol)"),
+        ("doppler", (0.001, 0.005, 0.01, 0.02, 0.035, 0.05), "override_doppler", "Normalized Doppler (fd Ts)"),
+        ("sir_db", (0, 5, 10, 15, 20, 25), "override_sir_db", "SIR (dB)"),
+        ("impulsive_probability", (0.0, 0.01, 0.025, 0.05, 0.075, 0.10), "override_imp_prob", "Spike probability"),
+        ("pa_drive", (0.6, 0.9, 1.2, 1.5, 1.8), "override_pa_drive", "PA drive gain"),
     )
-    _save_roc_figure(config.snr_sweep_db, roc_auc_results, roc_at_12_db)
-    _save_epoch_figure(training_history)
-    snr_keys = [str(snr) for snr in config.snr_sweep_db]
+    stress_results: dict[str, dict[str, object]] = {}
+    for sweep_name, values, override_key, x_label in stress_specs:
+        print(f"Stress sweep: {sweep_name}", flush=True)
+        model_curves = {name: [] for name in MODEL_FACTORIES}
+        for value_index, value in enumerate(values):
+            arrays = WirelessChannelSimulator(
+                config, config.seed + 2000 + value_index + len(stress_results) * 100
+            ).generate(
+                config.stress_bursts,
+                snr_db=15.0,
+                **{override_key: value},
+            )
+            for name, model in models.items():
+                logits, labels, _ = _evaluation_outputs(model, arrays, config.device)
+                model_curves[name].append(float(np.mean((logits >= 0.0) != labels)))
+        stress_results[sweep_name] = {
+            "values": list(values),
+            "x_label": x_label,
+            "ber": model_curves,
+        }
+
+    ablation_results: dict[str, dict[str, float]] = {}
+    for index, disabled in enumerate((None, *IMPAIRMENT_NAMES)):
+        case_name = "all_active" if disabled is None else f"without_{disabled}"
+        print(f"Ablation: {case_name}", flush=True)
+        arrays = WirelessChannelSimulator(config, config.seed + 3000 + index).generate(
+            config.ablation_bursts, snr_db=15.0, disabled_impairment=disabled
+        )
+        ablation_results[case_name] = {}
+        for name, model in models.items():
+            logits, labels, _ = _evaluation_outputs(model, arrays, config.device)
+            ablation_results[case_name][name] = float(np.mean((logits >= 0.0) != labels))
+
+    for name, model in models.items():
+        macs = _profile_operations(model, config.device)
+        latency_ms = _latency_ms_per_10k(model, validation_arrays[0], config.device)
+        complexity[name].update({
+            "macs_per_symbol": macs,
+            "flops_per_symbol": 2 * macs,
+            "latency_ms_per_10000_windows": latency_ms,
+            "throughput_symbols_per_second": 10_000_000.0 / latency_ms,
+        })
+        print(
+            f"Complexity {name}: params={complexity[name]['trainable_parameters']:,}, "
+            f"FP32={complexity[name]['weight_footprint_kb_fp32']:.2f} KB, "
+            f"MACs/symbol={macs:,}, FLOPs/symbol={2 * macs:,}, "
+            f"latency={latency_ms:.3f} ms/10,000 windows, "
+            f"throughput={10_000_000.0 / latency_ms:,.0f} symbols/s",
+            flush=True,
+        )
+
+    awgn_theory = {
+        str(snr): 0.5 * math.erfc(math.sqrt(10.0 ** (snr / 10.0)))
+        for snr in config.snr_sweep_db
+    }
     metrics: dict[str, object] = {
         "configuration": asdict(config),
-        "device": config.device,
         "windows_per_burst": config.burst_len - config.window_len + 1,
-        "training_windows": len(train_arrays[0]),
-        "validation_windows": len(validation_arrays[0]),
         "complexity": complexity,
-        "ber_vs_snr": sweep_results,
+        "ber_vs_snr": ber_results,
+        "fer_vs_snr": fer_results,
         "accuracy_vs_snr": accuracy_results,
-        "roc_auc_vs_snr": roc_auc_results,
+        "roc_auc_vs_snr": auc_results,
         "mean_accuracy_across_snr": {
-            name: float(np.mean([values[snr] for snr in snr_keys]))
-            for name, values in accuracy_results.items()
+            name: float(np.mean(list(values.values()))) for name, values in accuracy_results.items()
         },
         "mean_roc_auc_across_snr": {
-            name: float(np.mean([values[snr] for snr in snr_keys]))
-            for name, values in roc_auc_results.items()
+            name: float(np.mean(list(values.values()))) for name, values in auc_results.items()
         },
+        "theoretical_bpsk_awgn_ber": awgn_theory,
+        "snr_required_db_at_target_ber": snr_required,
+        "snr_gain_db_vs_mlp": snr_gain,
+        "ber_error_floor": {
+            name: {"20_db": values["20"], "24_db": values["24"]}
+            for name, values in ber_results.items()
+        },
+        "test_bce_at_10_db": test_bce,
+        "evm_rms_percent_at_12_db": evm,
+        "stress_sweeps_at_15_db": stress_results,
+        "leave_one_out_ablation_at_15_db": ablation_results,
         "training_history": training_history,
-        "latency_method": "Median of 3 CPU/GPU inference passes, batch size 256, exactly 10,000 windows when available.",
-        "figure": "bpsk_cnn_benchmark_results.png",
-        "roc_figure": "bpsk_roc_auc_results.png",
-        "epoch_figure": "training_epoch_analysis.png",
+        "figures": [
+            "bpsk_composite_evaluation.png",
+            "bpsk_impairment_stress_sweeps.png",
+            "bpsk_cnn_benchmark_results.png",
+            "bpsk_roc_auc_results.png",
+            "training_epoch_analysis.png",
+        ],
+        "latency_method": "Median of three inference passes over exactly 10,000 windows, batch size 256.",
+        "mac_definition": "Forward-hook multiply-accumulate count for Conv1d, ConvTranspose1d, and Linear per decoded window; FLOPs=2*MACs.",
     }
-    Path("benchmark_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print("\nSaved benchmark_metrics.json and bpsk_cnn_benchmark_results.png", flush=True)
+    _save_composite_figure(
+        ber_results, fer_results, config.snr_sweep_db, awgn_theory,
+        inputs_12, autoencoder, evm, config,
+    )
+    _save_stress_figure(stress_results, ablation_results)
+    _save_figure(ber_results, config.snr_sweep_db, inputs_12, autoencoder, config)
+    _save_roc_figure(config.snr_sweep_db, auc_results, roc_at_12)
+    _save_epoch_figure(training_history)
+    with Path("benchmark_metrics.json").open("w", encoding="utf-8", newline="\n") as metrics_file:
+        json.dump(metrics, metrics_file, indent=2)
+        metrics_file.write("\n")
+    print("\nSaved benchmark_metrics.json and both evaluation figures.", flush=True)
     return metrics
 
 

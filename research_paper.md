@@ -12,17 +12,17 @@ used to compare a center-symbol multilayer perceptron (MLP), four 1-D
 convolutional architectures, and a denoising autoencoder (DAE) with a
 center-symbol classifier. Models are trained on 1,000 bursts and evaluated
 on 200 separate validation bursts and on 150 bursts at each SNR from 0 to
-20 dB in 2 dB increments. The benchmark records measured bit-error rate
-(BER), thresholded accuracy, ROC area under the curve (AUC), trainable
-parameter count, and inference latency per 10,000 windows.
-In this CPU run, the lowest measured BER was **0.04105** for the denoising
-autoencoder at **20 dB**. Latency ranged from **9.651 ms** to **390.541 ms**
-per 10,000 windows, and model sizes ranged from **641** to **24,449**
-trainable parameters. Across the 11 SNR points, DenoisingAE1D had the
-highest mean accuracy (**0.89496**) and mean ROC AUC (**0.94701**). At
-20 dB, its accuracy was **0.95895** and ROC AUC was **0.99068**. These
-results characterize the specified synthetic simulation and should not be
-interpreted as over-the-air performance.
+24 dB in 2 dB increments. The benchmark records BER, frame error rate (FER),
+thresholded accuracy, ROC AUC, calibration loss, impairment stress sweeps,
+leave-one-out ablations, and compute complexity. In this CPU run,
+DenoisingAE1D achieved the lowest BER (**0.03242 at 24 dB**) and the highest
+mean accuracy (**0.90821**) and mean ROC AUC (**0.95509**) across 13 SNR
+points. Latency ranged from **7.694 ms** to **298.200 ms** per 10,000
+windows; trainable parameter counts ranged from **641** to **24,449**.
+Neither requested BER target (0.02 or 0.01) was reached in the tested SNR
+range, so SNR gains are reported as unavailable rather than extrapolated.
+These results characterize the specified synthetic simulation and should
+not be interpreted as over-the-air performance.
 
 ## I. Introduction
 
@@ -99,8 +99,9 @@ sampled impairment parameters.
    approximation to Jakes temporal correlation [4].
 5. **AWGN:** Independent complex Gaussian noise is calibrated so that
    \(E_s/N_0\) matches the selected SNR. Training and validation SNRs are
-   uniform on \([5,20]\) dB; evaluation uses fixed points \(0,2,\ldots,20\)
-   dB.
+   uniform on \([5,20]\) dB; composite evaluation uses fixed points
+   \(0,2,\ldots,24\) dB. The 0–4 dB and 22–24 dB points are outside the
+   training SNR range.
 6. **Impulsive noise:** A Bernoulli mask with probability \(p=0.025\)
    selects samples for complex Gaussian spikes with power 5–10 times the
    thermal-noise power.
@@ -161,178 +162,186 @@ All models are optimized with AdamW, learning rate \(10^{-3}\), batch size
 
 ## IV. Experimental Setup and Results
 
-The training set contains 1,000 bursts (51,000 windows); validation contains
-200 separate bursts (10,200 windows). At each SNR point, 150 new bursts
-(7,650 windows) are generated. Models are evaluated by thresholding logits
-at zero. Accuracy is the fraction of correct center-bit decisions; BER is
-the fraction of incorrect decisions on the same samples. ROC AUC is
-calculated from raw logits using the rank-sum definition with average ranks
-for tied scores. The following tables report accuracy and AUC separately at
-every tested SNR, with their across-SNR means retained as a compact summary.
-Latency is the
-median of three inference passes over 10,000 validation windows in batches
-of 256, on the recorded device. Parameter counts include trainable weights
-and biases.
+The models were trained on 1,000 bursts (51,000 windows) and validated on 200 separate bursts (10,200 windows). Training SNR was sampled uniformly from 5-20 dB. The composite evaluation used 150 newly generated bursts (7,650 windows) at each SNR in 0, 2, ..., 24 dB; thus 0-4 dB and 22-24 dB are outside the training SNR range. All ten impairment categories remained active. BER, FER, accuracy, ROC AUC, and test BCE were computed from model logits, with a zero-logit decision threshold. A frame comprises the 51 overlapping window decisions from one burst. BCE is reported at 10 dB. Theoretical uncoded BPSK AWGN BER is calculated as $0.5\operatorname{erfc}(\sqrt{10^{\mathrm{SNR}/10}})$.
 
-### A. Complexity and latency
+Five impairment stress sweeps used 15 dB thermal AWGN and 150 bursts per tested parameter value, keeping all other categories active at their nominal randomized settings. The leave-one-out (LOO) study used a separate 150-burst all-active baseline and ten additional 150-burst tests, each disabling one impairment category. All results are single-seed synthetic-simulation measurements.
 
-| Model | Trainable parameters | Latency (ms / 10,000 windows) | Mean accuracy | Mean ROC AUC |
-|---|---:|---:|---:|---:|
-| MLPBaseline | 641 | 9.651 | 0.78617 | 0.86682 |
-| VanillaCNN1D | 19,169 | 203.795 | 0.67597 | 0.74401 |
-| ResNet1D | 24,449 | 305.544 | 0.85153 | 0.92055 |
-| Inception1D | 11,009 | 390.541 | 0.73908 | 0.81765 |
-| DenseNet1D | 7,505 | 199.196 | 0.66737 | 0.73507 |
-| DenoisingAE1D | 13,061 | 162.653 | 0.89496 | 0.94701 |
+### A. BER and composite channel performance
 
-Mean accuracy and mean ROC AUC are unweighted arithmetic means of the
-per-SNR results across the 11 equally weighted SNR points.
-
-### B. BER versus SNR
 
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0  | 0.26601 | 0.35595 | 0.25634 | 0.30209 | 0.35895 | 0.24052 |
-| 2  | 0.25608 | 0.35072 | 0.23869 | 0.29124 | 0.35778 | 0.21098 |
-| 4  | 0.23046 | 0.32980 | 0.19647 | 0.26719 | 0.33961 | 0.16131 |
-| 6  | 0.21856 | 0.33150 | 0.16810 | 0.26641 | 0.33739 | 0.12784 |
-| 8  | 0.20993 | 0.33033 | 0.14784 | 0.26680 | 0.33634 | 0.10131 |
-| 10 | 0.20248 | 0.31464 | 0.11765 | 0.25098 | 0.32588 | 0.06902 |
-| 12 | 0.19124 | 0.31176 | 0.11386 | 0.24771 | 0.32157 | 0.05895 |
-| 14 | 0.20732 | 0.30837 | 0.10235 | 0.24536 | 0.31686 | 0.05124 |
-| 16 | 0.19098 | 0.31647 | 0.09399 | 0.24693 | 0.32745 | 0.04588 |
-| 18 | 0.19255 | 0.30471 | 0.10118 | 0.24170 | 0.31804 | 0.04732 |
-| 20 | 0.18654 | 0.31007 | 0.09673 | 0.24366 | 0.31908 | 0.04105 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.27438 | 0.36131 | 0.26039 | 0.32288 | 0.37203 | 0.24261 |
+| 2 | 0.23124 | 0.35359 | 0.22196 | 0.30575 | 0.35935 | 0.19804 |
+| 4 | 0.22039 | 0.34902 | 0.19569 | 0.29124 | 0.35752 | 0.15346 |
+| 6 | 0.22131 | 0.33451 | 0.16915 | 0.28405 | 0.33869 | 0.13281 |
+| 8 | 0.20863 | 0.31542 | 0.13882 | 0.26052 | 0.32523 | 0.09882 |
+| 10 | 0.20928 | 0.31895 | 0.12144 | 0.25412 | 0.33281 | 0.07333 |
+| 12 | 0.19948 | 0.31634 | 0.10745 | 0.25791 | 0.32784 | 0.05987 |
+| 14 | 0.20732 | 0.31621 | 0.09268 | 0.25386 | 0.32275 | 0.05020 |
+| 16 | 0.19320 | 0.31216 | 0.08222 | 0.24706 | 0.32288 | 0.03673 |
+| 18 | 0.20405 | 0.32392 | 0.08235 | 0.25882 | 0.33712 | 0.04170 |
+| 20 | 0.19098 | 0.31124 | 0.08183 | 0.24850 | 0.31686 | 0.03529 |
+| 22 | 0.21190 | 0.32078 | 0.07922 | 0.25124 | 0.32641 | 0.03804 |
+| 24 | 0.20667 | 0.31150 | 0.07647 | 0.24562 | 0.31608 | 0.03242 |
 
-**Measured summary:** The minimum BER over all models and SNR points was
-0.04105 for DenoisingAE1D at 20 dB. The DAE also had the lowest BER at 12 dB
-(0.05895); the ResNet reached 0.11386 and the MLP 0.19124 at that SNR. The
-Vanilla CNN, Inception, and DenseNet did not outperform the MLP in this
-20-epoch run. The BER curves and 12 dB
-constellation visualization are saved as
-[`bpsk_cnn_benchmark_results.png`](./bpsk_cnn_benchmark_results.png).
-The right-hand plot compares received center I/Q samples with the
-autoencoder's reconstructed center I/Q samples; it is a qualitative
-visualization and does not replace the BER metric.
 
-### C. Accuracy and ROC-AUC comparison
+Accuracy and ROC AUC are reported at each SNR below. The unweighted means across the 13 equally weighted SNR points are retained separately in the model summary table.
 
 #### Accuracy by SNR
 
+
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0  | 0.73399 | 0.64405 | 0.74366 | 0.69791 | 0.64105 | 0.75948 |
-| 2  | 0.74392 | 0.64928 | 0.76131 | 0.70876 | 0.64222 | 0.78902 |
-| 4  | 0.76954 | 0.67020 | 0.80353 | 0.73281 | 0.66039 | 0.83869 |
-| 6  | 0.78144 | 0.66850 | 0.83190 | 0.73359 | 0.66261 | 0.87216 |
-| 8  | 0.79007 | 0.66967 | 0.85216 | 0.73320 | 0.66366 | 0.89869 |
-| 10 | 0.79752 | 0.68536 | 0.88235 | 0.74902 | 0.67412 | 0.93098 |
-| 12 | 0.80876 | 0.68824 | 0.88614 | 0.75229 | 0.67843 | 0.94105 |
-| 14 | 0.79268 | 0.69163 | 0.89765 | 0.75464 | 0.68314 | 0.94876 |
-| 16 | 0.80902 | 0.68353 | 0.90601 | 0.75307 | 0.67255 | 0.95412 |
-| 18 | 0.80745 | 0.69529 | 0.89882 | 0.75830 | 0.68196 | 0.95268 |
-| 20 | 0.81346 | 0.68993 | 0.90327 | 0.75634 | 0.68092 | 0.95895 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.7256 | 0.6387 | 0.7396 | 0.6771 | 0.6280 | 0.7574 |
+| 2 | 0.7688 | 0.6464 | 0.7780 | 0.6942 | 0.6407 | 0.8020 |
+| 4 | 0.7796 | 0.6510 | 0.8043 | 0.7088 | 0.6425 | 0.8465 |
+| 6 | 0.7787 | 0.6655 | 0.8308 | 0.7159 | 0.6613 | 0.8672 |
+| 8 | 0.7914 | 0.6846 | 0.8612 | 0.7395 | 0.6748 | 0.9012 |
+| 10 | 0.7907 | 0.6810 | 0.8786 | 0.7459 | 0.6672 | 0.9267 |
+| 12 | 0.8005 | 0.6837 | 0.8925 | 0.7421 | 0.6722 | 0.9401 |
+| 14 | 0.7927 | 0.6838 | 0.9073 | 0.7461 | 0.6773 | 0.9498 |
+| 16 | 0.8068 | 0.6878 | 0.9178 | 0.7529 | 0.6771 | 0.9633 |
+| 18 | 0.7959 | 0.6761 | 0.9176 | 0.7412 | 0.6629 | 0.9583 |
+| 20 | 0.8090 | 0.6888 | 0.9182 | 0.7515 | 0.6831 | 0.9647 |
+| 22 | 0.7881 | 0.6792 | 0.9208 | 0.7488 | 0.6736 | 0.9620 |
+| 24 | 0.7933 | 0.6885 | 0.9235 | 0.7544 | 0.6839 | 0.9676 |
+
 
 #### ROC AUC by SNR
 
+
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0  | 0.80157 | 0.70265 | 0.81076 | 0.76835 | 0.69740 | 0.82686 |
-| 2  | 0.82104 | 0.70873 | 0.84160 | 0.78477 | 0.70358 | 0.86735 |
-| 4  | 0.85006 | 0.73093 | 0.88409 | 0.80733 | 0.72276 | 0.90908 |
-| 6  | 0.86296 | 0.73872 | 0.90967 | 0.81302 | 0.73222 | 0.93945 |
-| 8  | 0.86988 | 0.73897 | 0.92815 | 0.81320 | 0.72969 | 0.95863 |
-| 10 | 0.88203 | 0.75381 | 0.94947 | 0.83255 | 0.74762 | 0.97699 |
-| 12 | 0.89083 | 0.75837 | 0.95392 | 0.83472 | 0.74921 | 0.98482 |
-| 14 | 0.87889 | 0.76316 | 0.96059 | 0.83356 | 0.75034 | 0.98598 |
-| 16 | 0.89451 | 0.75613 | 0.96224 | 0.83370 | 0.74639 | 0.98848 |
-| 18 | 0.89121 | 0.76822 | 0.96305 | 0.84025 | 0.75655 | 0.98879 |
-| 20 | 0.89209 | 0.76443 | 0.96250 | 0.83274 | 0.74996 | 0.99068 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.8003 | 0.6948 | 0.8143 | 0.7585 | 0.6870 | 0.8254 |
+| 2 | 0.8453 | 0.7103 | 0.8504 | 0.7799 | 0.6984 | 0.8702 |
+| 4 | 0.8609 | 0.7177 | 0.8849 | 0.7975 | 0.7081 | 0.9165 |
+| 6 | 0.8553 | 0.7311 | 0.9079 | 0.8066 | 0.7238 | 0.9356 |
+| 8 | 0.8749 | 0.7526 | 0.9358 | 0.8299 | 0.7398 | 0.9609 |
+| 10 | 0.8788 | 0.7548 | 0.9479 | 0.8362 | 0.7428 | 0.9785 |
+| 12 | 0.8870 | 0.7553 | 0.9568 | 0.8357 | 0.7444 | 0.9836 |
+| 14 | 0.8757 | 0.7594 | 0.9647 | 0.8398 | 0.7492 | 0.9881 |
+| 16 | 0.8983 | 0.7718 | 0.9726 | 0.8508 | 0.7555 | 0.9934 |
+| 18 | 0.8846 | 0.7529 | 0.9691 | 0.8358 | 0.7354 | 0.9892 |
+| 20 | 0.8906 | 0.7647 | 0.9713 | 0.8403 | 0.7515 | 0.9905 |
+| 22 | 0.8801 | 0.7582 | 0.9716 | 0.8374 | 0.7449 | 0.9917 |
+| 24 | 0.8840 | 0.7676 | 0.9723 | 0.8407 | 0.7528 | 0.9926 |
 
-DenoisingAE1D achieved the highest accuracy and ROC AUC at every tested SNR
-in this run. At 12 dB, its accuracy was 0.94105 and AUC was 0.98482,
-followed by ResNet1D (0.88614 accuracy, 0.95392 AUC). Accuracy equals
-\(1-\mathrm{BER}\) because both use the same binary threshold and samples.
-Unrounded per-SNR values are available in `benchmark_metrics.json`.
 
-The classic ROC curves at 12 dB, labeled with each model's AUC, and the
-per-SNR AUC curves are shown in
-[`bpsk_roc_auc_results.png`](./bpsk_roc_auc_results.png).
+#### Model-level composite metrics
 
-### D. Epoch-wise training analysis
 
-All six models were trained for 20 epochs with the same training set,
-optimizer family, learning rate, and batch size. The benchmark records
-training loss, validation accuracy, and validation ROC AUC after every
-epoch in `benchmark_metrics.json`. The histories are visualized in
-[`training_epoch_analysis.png`](./training_epoch_analysis.png).
+| Model | Mean accuracy | Mean AUC | BER @20 dB | BER @24 dB | FER @24 dB | BCE @10 dB |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MLPBaseline | 0.7862 | 0.8704 | 0.19098 | 0.20667 | 0.9533 | 0.4326 |
+| VanillaCNN1D | 0.6735 | 0.7455 | 0.31124 | 0.31150 | 1.0000 | 0.5861 |
+| ResNet1D | 0.8685 | 0.9323 | 0.08183 | 0.07647 | 0.9067 | 0.2989 |
+| Inception1D | 0.7322 | 0.8222 | 0.24850 | 0.24562 | 1.0000 | 0.5200 |
+| DenseNet1D | 0.6650 | 0.7333 | 0.31686 | 0.31608 | 1.0000 | 0.5962 |
+| DenoisingAE1D | 0.9082 | 0.9551 | 0.03529 | 0.03242 | 0.3800 | 0.1889 |
 
-| Model | Validation accuracy, epoch 1 | Validation accuracy, epoch 20 | Best validation accuracy (epoch) | Training loss, epoch 1 → 20 |
-|---|---:|---:|---:|---:|
-| MLPBaseline | 0.8025 | 0.8033 | 0.8049 (6) | 0.5421 → 0.4338 |
-| VanillaCNN1D | 0.6266 | 0.6766 | 0.6767 (17) | 0.6526 → 0.5761 |
-| ResNet1D | 0.6528 | 0.8843 | 0.8843 (20) | 0.6488 → 0.2758 |
-| Inception1D | 0.6133 | 0.7410 | 0.7426 (19) | 0.6557 → 0.5054 |
-| DenseNet1D | 0.6016 | 0.6708 | 0.6708 (20) | 0.6630 → 0.5892 |
-| DenoisingAE1D | 0.9221 | 0.9330 | 0.9366 (19) | 0.5236 → 0.2191 |
 
-Over the fixed 20 epochs, MLPBaseline was effectively at a validation
-accuracy plateau by its first epoch (best 0.8049 at epoch 6), despite its
-training loss continuing to decline. VanillaCNN1D and DenseNet1D improved
-more gradually, gaining about 5.0 and 6.9 percentage points in validation
-accuracy from epoch 1 to 20; both were still at or near their best measured
-accuracy at the end. ResNet1D showed the largest gain, from 0.6528 to
-0.8843, with lower training loss each epoch and its best validation
-accuracy at the final epoch, suggesting that this run does not show
-convergence by epoch 20. Inception1D gained about 12.8 percentage points,
-peaked at epoch 19, and dipped slightly at epoch 20. DenoisingAE1D began
-with high validation accuracy (0.9221), achieved its peak (0.9366) at epoch
-19, and reduced the composite training loss from 0.5236 to 0.2191; its
-validation performance largely plateaued late in training. These are
-single-seed observations, not a basis for changing the epoch budget without
-additional repeated-run validation.
+The lowest observed BER at 24 dB was 0.03242 for DenoisingAE1D. Its BER was 0.03529 at 20 dB and 0.03242 at 24 dB. ResNet1D was the next-best CNN at those points (0.08183 and 0.07647). Despite increasing SNR, BER remains well above the textbook pure-AWGN reference because the simulation keeps hardware and propagation impairments active. The finite-sample measurement at each point is 7,650 overlapping windows; the plotted BER floor only affects visualization, not the exact JSON value.
+
+The requested BER targets of 0.02 and 0.01 were not crossed by any measured curve from 0 to 24 dB. Consequently, the interpolated SNR requirements and SNR gains relative to MLPBaseline are reported as `null` rather than extrapolated. Exact BER at 20 and 24 dB is tabulated above and recorded under `ber_error_floor` in the metrics file.
+
+### B. Complexity and measured compute
+
+Forward hooks counted multiply-accumulates in `Conv1d`, `ConvTranspose1d`, and `Linear` layers for one 16-sample window. FLOPs are defined as twice MACs; activation, normalization, and pooling operations are not included. Weight footprint is FP32 parameter storage. Latency is the median of three CPU inference passes over exactly 10,000 windows in batches of 256; throughput is 10,000 divided by elapsed time.
+
+
+| Model | Parameters | FP32 KB | MACs/window | FLOPs/window | Latency (ms/10k) | Throughput (windows/s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MLPBaseline | 641 | 2.50 | 592 | 1,184 | 7.694 | 1,299,748 |
+| VanillaCNN1D | 19,169 | 74.88 | 298,048 | 596,096 | 162.478 | 61,547 |
+| ResNet1D | 24,449 | 95.50 | 380,992 | 761,984 | 238.713 | 41,891 |
+| Inception1D | 11,009 | 43.00 | 169,024 | 338,048 | 298.200 | 33,535 |
+| DenseNet1D | 7,505 | 29.32 | 113,744 | 227,488 | 137.935 | 72,498 |
+| DenoisingAE1D | 13,061 | 51.02 | 78,338 | 156,676 | 108.104 | 92,504 |
+
+
+The MLP is the smallest/fastest model (641 parameters; 7.694 ms/10,000 windows), while ResNet1D has the most trainable parameters (24,449). Inception1D has the largest measured latency (298.200 ms/10,000 windows) despite fewer parameters than ResNet, demonstrating that parameter count alone does not determine runtime.
+
+### C. Calibration, frame reliability, and EVM
+
+At 24 dB, DenoisingAE1D's FER was 0.3800 (57 of 150 bursts with at least one error, subject to the finite sample) while its BER was 0.03242. The contrast illustrates that frame success is a stricter requirement than individual-bit success. Its BCE at 10 dB was 0.1889 compared with 0.4326 for the MLP.
+
+At 12 dB, RMS EVM against the ideal clean center I/Q samples was 95.44% for raw received windows and 60.61% after DenoisingAE1D reconstruction. The visualization is in [bpsk_composite_evaluation.png](./bpsk_composite_evaluation.png); EVM measures symbol-vector distance and is distinct from bit error rate.
+
+### D. Impairment stress sweeps and LOO ablation
+
+Each value below is measured with 15 dB AWGN. The five sweep curves for every architecture are plotted in [bpsk_impairment_stress_sweeps.png](./bpsk_impairment_stress_sweeps.png); the complete point-by-point values are in `stress_sweeps_at_15_db` in the JSON file. The ranges in each cell are the minimum-to-maximum measured BER over that sweep, not confidence intervals.
+
+
+| Sweep | Tested values | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cfo | 0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03 | 0.181 to 0.596 | 0.313 to 0.560 | 0.082 to 0.627 | 0.253 to 0.581 | 0.318 to 0.558 | 0.040 to 0.650 |
+| doppler | 0.001, 0.005, 0.01, 0.02, 0.035, 0.05 | 0.181 to 0.203 | 0.305 to 0.320 | 0.081 to 0.100 | 0.241 to 0.268 | 0.312 to 0.330 | 0.034 to 0.054 |
+| sir_db | 0, 5, 10, 15, 20, 25 | 0.188 to 0.294 | 0.304 to 0.363 | 0.076 to 0.266 | 0.249 to 0.301 | 0.316 to 0.367 | 0.037 to 0.269 |
+| impulsive_probability | 0.0, 0.01, 0.025, 0.05, 0.075, 0.1 | 0.192 to 0.211 | 0.311 to 0.325 | 0.079 to 0.097 | 0.250 to 0.260 | 0.325 to 0.329 | 0.039 to 0.054 |
+| pa_drive | 0.6, 0.9, 1.2, 1.5, 1.8 | 0.194 to 0.209 | 0.310 to 0.316 | 0.079 to 0.110 | 0.247 to 0.262 | 0.316 to 0.328 | 0.036 to 0.059 |
+
+
+The CFO sweep is especially disruptive at the largest offsets, where several models approach chance-level decisions. Larger SIR values generally reduce interference and improve BER, especially for ResNet1D and DenoisingAE1D. Doppler and impulsive-noise curves are comparatively flatter over the specified ranges, though small sample-to-sample fluctuations are present. Stress results are conditional on the other randomly sampled impairments and should be interpreted as controlled synthetic tests, not isolated physical measurements.
+
+The LOO table reports BER at 15 dB. Positive improvement relative to `all_active` means that disabling the impairment reduced BER; a negative change means removing it did not help on that finite randomized sample.
+
+
+| LOO case | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| all_active | 0.2038 | 0.3161 | 0.0839 | 0.2478 | 0.3190 | 0.0392 |
+| without_pa | 0.1949 | 0.3191 | 0.1030 | 0.2698 | 0.3243 | 0.0599 |
+| without_multipath | 0.0472 | 0.3027 | 0.0573 | 0.2210 | 0.3099 | 0.0073 |
+| without_isi | 0.0809 | 0.3298 | 0.1013 | 0.2708 | 0.3367 | 0.0626 |
+| without_doppler | 0.2041 | 0.3119 | 0.0986 | 0.2540 | 0.3205 | 0.0506 |
+| without_awgn | 0.1996 | 0.3237 | 0.0801 | 0.2556 | 0.3311 | 0.0352 |
+| without_impulsive | 0.1974 | 0.3072 | 0.0754 | 0.2416 | 0.3157 | 0.0327 |
+| without_cci_aci | 0.2010 | 0.3136 | 0.0784 | 0.2569 | 0.3231 | 0.0363 |
+| without_cfo | 0.2041 | 0.3156 | 0.0865 | 0.2518 | 0.3233 | 0.0421 |
+| without_phase_noise | 0.2013 | 0.3201 | 0.0973 | 0.2580 | 0.3286 | 0.0528 |
+| without_iq_dc | 0.1970 | 0.3097 | 0.0923 | 0.2498 | 0.3247 | 0.0482 |
+
+
+Removing multipath produced the largest BER reduction among the single-category ablations for every model in this run. For example, MLPBaseline BER changed from 0.2038 to 0.0472, and DenoisingAE1D changed from 0.0392 to 0.0073. The effect size varies by architecture. Small changes or slight degradations for other ablations can arise from interactions among impairments and random sampling.
+
+### E. Epoch-wise training
+
+
+| Model | Validation accuracy, epoch 1 | Epoch 20 | Best validation accuracy | Training loss, epoch 1 to 20 |
+| ---: | ---: | ---: | ---: | ---: |
+| MLPBaseline | 0.7916 | 0.7921 | 0.7942 (epoch 3) | 0.5376 to 0.4344 |
+| VanillaCNN1D | 0.6181 | 0.6798 | 0.6798 (epoch 20) | 0.6538 to 0.5757 |
+| ResNet1D | 0.6412 | 0.8888 | 0.8888 (epoch 20) | 0.6498 to 0.2693 |
+| Inception1D | 0.6260 | 0.7408 | 0.7474 (epoch 17) | 0.6545 to 0.5088 |
+| DenseNet1D | 0.5952 | 0.6656 | 0.6705 (epoch 15) | 0.6631 to 0.5925 |
+| DenoisingAE1D | 0.9163 | 0.9343 | 0.9355 (epoch 15) | 0.5344 to 0.2330 |
+
+
+The per-epoch curves are saved in [training_epoch_analysis.png](./training_epoch_analysis.png). These are single-run histories; they describe optimization under this seed and data generator and do not establish statistical significance.
 
 ## V. Discussion
 
-The best result was achieved by the DAE, whose BER decreased from 0.24052 at
-0 dB to 0.04105 at 20 dB. The ResNet also improved with SNR and reached
-0.09673 at 20 dB. By contrast, the MLP reached 0.18654, while the Vanilla
-CNN, Inception, and DenseNet remained above 0.24 at 20 dB. This indicates
-that adding convolutions alone did not guarantee improved equalization under
-the chosen architectures, pooling, training duration, and synthetic channel.
-The DAE's reconstruction objective appears beneficial here, but this single
-seed does not establish that it will generalize better in other settings.
-The ranking metrics support the same comparison: DenoisingAE1D reached
-0.99068 ROC AUC and 0.95895 accuracy at 20 dB, while ResNet1D reached
-0.96250 ROC AUC and 0.90327 accuracy. ROC AUC uses raw logits and is
-threshold-independent, whereas accuracy and BER share the zero-logit
-decision threshold. High AUC with lower accuracy can indicate useful score
-ordering despite imperfect threshold calibration.
+DenoisingAE1D achieved the strongest measured BER/accuracy/AUC profile in this synthetic experiment, followed by ResNet1D. The Autoencoder reached BER 0.03242 at 24 dB, but still did not cross the requested 0.02 BER SNR-gain threshold. High SNR therefore does not remove errors introduced by the other active impairments. The FER result also shows that a modest bit-error probability can yield frequent frame failures when a frame contains 51 decisions.
 
-The MLP was the smallest and fastest model (641 parameters; 9.651 ms per
-10,000 windows). The ResNet was the largest (24,449 parameters), while
-Inception had the highest measured latency (390.541 ms); the DAE used 13,061
-parameters and 162.653 ms. These timings were measured with CPU PyTorch and
-are host-specific. They do not establish receiver deadlines for an SDR
-platform.
+The model trade-off is not simply model size versus quality. The MLP has 641 parameters and the lowest host latency, but its BER is substantially higher than the DAE and ResNet at high SNR. ResNet has the largest parameter count and high MAC count; Inception has the highest observed latency, plausibly reflecting its parallel branches and runtime overhead. The DAE is slower and larger than MLP but has lower measured BER in this run. Latency is CPU/PyTorch-specific and does not establish suitability for a real-time SDR receiver without target-hardware profiling and deadline analysis.
 
-The results are limited by the synthetic channel, assumed parameter
-distributions, finite training/evaluation sample counts, simplified
-coherent-phase handling, and absence of measured RF front-end data. They
-support a controlled architecture comparison, not a claim of field
-performance. Follow-up work should evaluate held-out impairment regimes,
-multiple random seeds, a larger Monte Carlo sample, pilot-aided phase
-tracking, and recorded over-the-air data.
+The stress and ablation results expose different sensitivities. CFO becomes severe as phase rotation accumulates across the burst. At the ablation setting, removing multipath helped all six networks most, though this effect is conditional on the generator's channel construction and the remaining impairments. These findings do not establish a universal ranking of physical impairments: one-factor sweeps retain random variation in all other conditions, and finite Monte Carlo samples produce uncertainty.
+
+The study is limited to a synthetic baseband model with fixed distributions, idealized direct-path phase tracking, per-window AGC, and no measured RF front-end data. Training and evaluation samples are generated from the same basic simulator, so the OOD test is only an SNR-range shift, not a complete channel-distribution shift. Future work should report repeated-seed confidence intervals, wider independent channel distributions, calibrated over-the-air recordings, pilot-aided synchronization baselines, and conventional equalizer comparisons.
+
 
 ## VI. Conclusion and Future Work
 
-A common burst-based evaluation pipeline was specified for a center-symbol
-MLP, four 1-D CNN families, and a denoising autoencoder. The implementation
-produces BER-versus-SNR values, parameter counts, host inference latency,
-and a constellation comparison under a ten-category synthetic impairment
-model. Future work should broaden the channel distributions, report
-confidence intervals over repeated seeds, compare with conventional
-equalizers, and validate on real measured data.
+A common burst-based evaluation pipeline compared a center-symbol MLP, four
+1-D CNN families, and a denoising autoencoder under ten synthetic impairment
+categories. The evaluation reports BER, FER, calibration loss, EVM, OOD SNR
+behavior, impairment-specific stress sweeps, LOO ablations, and hook-based
+compute estimates alongside model size and host latency. DenoisingAE1D
+achieved the lowest measured BER (0.03242 at 24 dB) in this run, but none of
+the models reached the requested 0.02 or 0.01 BER targets. Future work should
+broaden the channel distributions, report confidence intervals over
+repeated seeds, compare with conventional equalizers, and validate on
+measured over-the-air data.
 
 ## References
 
