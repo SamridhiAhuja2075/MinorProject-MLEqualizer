@@ -16,6 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from numpy.typing import NDArray
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -115,6 +116,7 @@ class WirelessChannelSimulator:
         *,
         disabled_impairment: str | None = None,
         override_cfo: float | None = None,
+        override_phase_noise_std: float | None = None,
         override_doppler: float | None = None,
         override_sir_db: float | None = None,
         override_imp_prob: float | None = None,
@@ -129,9 +131,18 @@ class WirelessChannelSimulator:
             raise ValueError("override_pa_drive cannot be negative.")
         if override_doppler is not None and override_doppler < 0:
             raise ValueError("override_doppler cannot be negative.")
+        if override_phase_noise_std is not None and override_phase_noise_std < 0:
+            raise ValueError("override_phase_noise_std cannot be negative.")
         if any(
             value is not None and not math.isfinite(value)
-            for value in (override_cfo, override_doppler, override_sir_db, override_imp_prob, override_pa_drive)
+            for value in (
+                override_cfo,
+                override_phase_noise_std,
+                override_doppler,
+                override_sir_db,
+                override_imp_prob,
+                override_pa_drive,
+            )
         ):
             raise ValueError("Override values must be finite.")
         bits = self.rng.integers(0, 2, size=cfg.burst_len).astype(np.float32)
@@ -229,7 +240,11 @@ class WirelessChannelSimulator:
 
         # 9. Cumulative Wiener phase noise.
         if disabled_impairment != "phase_noise":
-            phase_step_std = self.rng.uniform(0.01, 0.05)
+            phase_step_std = (
+                override_phase_noise_std
+                if override_phase_noise_std is not None
+                else self.rng.uniform(0.01, 0.05)
+            )
             phase_walk = np.cumsum(self.rng.normal(0.0, phase_step_std, cfg.burst_len))
             received *= np.exp(1j * phase_walk)
 
@@ -257,6 +272,7 @@ class WirelessChannelSimulator:
         *,
         disabled_impairment: str | None = None,
         override_cfo: float | None = None,
+        override_phase_noise_std: float | None = None,
         override_doppler: float | None = None,
         override_sir_db: float | None = None,
         override_imp_prob: float | None = None,
@@ -277,6 +293,7 @@ class WirelessChannelSimulator:
                 current_snr,
                 disabled_impairment=disabled_impairment,
                 override_cfo=override_cfo,
+                override_phase_noise_std=override_phase_noise_std,
                 override_doppler=override_doppler,
                 override_sir_db=override_sir_db,
                 override_imp_prob=override_imp_prob,
@@ -311,6 +328,7 @@ class WirelessChannelSimulator:
         *,
         disabled_impairment: str | None = None,
         override_cfo: float | None = None,
+        override_phase_noise_std: float | None = None,
         override_doppler: float | None = None,
         override_sir_db: float | None = None,
         override_imp_prob: float | None = None,
@@ -323,6 +341,7 @@ class WirelessChannelSimulator:
             snr_range,
             disabled_impairment=disabled_impairment,
             override_cfo=override_cfo,
+            override_phase_noise_std=override_phase_noise_std,
             override_doppler=override_doppler,
             override_sir_db=override_sir_db,
             override_imp_prob=override_imp_prob,
@@ -493,6 +512,75 @@ class DenoisingAE1D(nn.Module):
         return self.classifier(reconstruction[:, :, 8]), reconstruction
 
 
+class DualDomainHybridAE(nn.Module):
+    """Cascaded Cartesian denoiser and polar variational autoencoder."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cart_enc1 = nn.Conv1d(2, 32, 3, stride=2, padding=1)
+        self.cart_enc2 = nn.Conv1d(32, 32, 3, stride=2, padding=1)
+        self.cart_dec1 = nn.ConvTranspose1d(
+            32, 32, 3, stride=2, padding=1, output_padding=1
+        )
+        self.cart_dec2 = nn.ConvTranspose1d(
+            32, 2, 3, stride=2, padding=1, output_padding=1
+        )
+
+        self.polar_encoder = nn.Sequential(
+            nn.Conv1d(3, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(32, 32, 3, padding=1),
+            nn.GELU(),
+        )
+        self.mu_layer = nn.Linear(32, 4)
+        self.logvar_layer = nn.Linear(32, 4)
+        self.polar_decoder = nn.Sequential(
+            nn.Conv1d(4, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(32, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(32, 3, 3, padding=1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(18, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        e1 = F.gelu(self.cart_enc1(x))
+        e2 = F.gelu(self.cart_enc2(e1))
+        d1 = self.cart_dec1(e2) + e1
+        x_cart = self.cart_dec2(F.gelu(d1))
+
+        i_values, q_values = x_cart[:, 0], x_cart[:, 1]
+        radius = torch.sqrt(i_values.square() + q_values.square() + 1e-6)
+        polar = torch.stack(
+            (radius, i_values / radius, q_values / radius),
+            dim=1,
+        )
+        encoded = self.polar_encoder(polar).transpose(1, 2)
+        mu = self.mu_layer(encoded)
+        logvar = self.logvar_layer(encoded).clamp(min=-10.0, max=10.0)
+        if self.training:
+            latent = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+        else:
+            latent = mu
+
+        decoded = self.polar_decoder(latent.transpose(1, 2))
+        radius_hat = F.softplus(decoded[:, 0])
+        phase_pair = decoded[:, 1:3]
+        phase_norm = torch.sqrt(phase_pair.square().sum(dim=1, keepdim=True) + 1e-8)
+        cos_hat, sin_hat = (phase_pair / phase_norm).unbind(dim=1)
+        recon_iq = torch.stack(
+            (radius_hat * cos_hat, radius_hat * sin_hat),
+            dim=1,
+        )
+        classifier_features = torch.cat((recon_iq[:, :, 8], mu.mean(dim=-1)), dim=1)
+        bit_logit = self.classifier(classifier_features)
+        return bit_logit, recon_iq, x_cart, mu, logvar
+
+
 MODEL_FACTORIES: dict[str, type[nn.Module]] = {
     "MLPBaseline": MLPBaseline,
     "VanillaCNN1D": VanillaCNN1D,
@@ -500,6 +588,7 @@ MODEL_FACTORIES: dict[str, type[nn.Module]] = {
     "Inception1D": Inception1D,
     "DenseNet1D": DenseNet1D,
     "DenoisingAE1D": DenoisingAE1D,
+    "DualDomainHybridAE": DualDomainHybridAE,
 }
 
 
@@ -532,7 +621,20 @@ def _train_one(
             clean = clean.to(config.device)
             optimizer.zero_grad(set_to_none=True)
             output = model(inputs)
-            if isinstance(output, tuple):
+            if isinstance(model, DualDomainHybridAE):
+                if not isinstance(output, tuple) or len(output) != 5:
+                    raise TypeError("DualDomainHybridAE must return five output tensors.")
+                logits, reconstruction, cartesian, mu, logvar = output
+                kl_loss = -0.5 * torch.mean(
+                    (1.0 + logvar - mu.square() - logvar.exp()).sum(dim=-1)
+                )
+                loss = (
+                    bce(logits, labels)
+                    + 0.5 * mse(reconstruction, clean)
+                    + 0.25 * mse(cartesian, clean)
+                    + 0.005 * kl_loss
+                )
+            elif isinstance(output, tuple):
                 logits, reconstruction = output
                 loss = bce(logits, labels) + 0.5 * mse(reconstruction, clean)
             else:
@@ -765,12 +867,15 @@ def _latency_ms_per_10k(model: nn.Module, inputs: FloatArray, device: str) -> fl
 
 
 @torch.inference_mode()
-def _reconstruct(model: DenoisingAE1D, inputs: FloatArray, device: str) -> FloatArray:
+def _reconstruct(model: nn.Module, inputs: FloatArray, device: str) -> FloatArray:
     model.eval()
     outputs: list[FloatArray] = []
     for start in range(0, len(inputs), 512):
         batch = torch.from_numpy(inputs[start : start + 512]).to(device)
-        _, reconstruction = model(batch)
+        output = model(batch)
+        if not isinstance(output, tuple):
+            raise TypeError("Reconstruction model must return a tuple.")
+        reconstruction = output[1]
         outputs.append(reconstruction.cpu().numpy())
     return np.concatenate(outputs)
 
@@ -779,10 +884,12 @@ def _save_figure(
     results: dict[str, dict[str, float]],
     snrs: tuple[int, ...],
     constellation_inputs: FloatArray,
-    autoencoder: DenoisingAE1D,
+    dae: DenoisingAE1D,
+    hybrid: DualDomainHybridAE,
+    evm: dict[str, float],
     config: BenchmarkConfig,
 ) -> None:
-    figure, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    figure, axes = plt.subplots(1, 4, figsize=(24, 5.5))
     ber_plot_floor = 1.0 / (
         config.sweep_bursts * (config.burst_len - config.window_len + 1)
     )
@@ -795,16 +902,18 @@ def _save_figure(
 
     count = min(2500, len(constellation_inputs))
     sample = constellation_inputs[:count]
-    reconstructed = _reconstruct(autoencoder, sample, config.device)
-    before_iq = sample[:, :, 8]
-    after_iq = reconstructed[:, :, 8]
-    axes[1].scatter(before_iq[:, 0], before_iq[:, 1], s=8, alpha=0.3, label="Before denoising")
-    axes[1].scatter(after_iq[:, 0], after_iq[:, 1], s=8, alpha=0.3, label="After denoising")
-    axes[1].set(title="Center-symbol I/Q at 12 dB", xlabel="In-phase (I)", ylabel="Quadrature (Q)")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].axis("equal")
-    axes[1].legend(fontsize=8)
-    figure.tight_layout()
+    dae_reconstruction = _reconstruct(dae, sample, config.device)
+    hybrid_reconstruction = _reconstruct(hybrid, sample, config.device)
+    raw_center = sample[:, :, 8]
+    _draw_constellation_panels(
+        axes[1:],
+        raw_center,
+        dae_reconstruction[:, :, 8],
+        hybrid_reconstruction[:, :, 8],
+        evm,
+    )
+    figure.suptitle("12 dB constellation comparison", y=0.99)
+    figure.tight_layout(rect=(0, 0, 1, 0.94))
     figure.savefig("bpsk_cnn_benchmark_results.png", dpi=180)
     plt.close(figure)
 
@@ -886,11 +995,12 @@ def _save_composite_figure(
     snrs: tuple[int, ...],
     awgn_ber: dict[str, float],
     constellation_inputs: FloatArray,
-    autoencoder: DenoisingAE1D,
+    dae: DenoisingAE1D,
+    hybrid: DualDomainHybridAE,
     evm: dict[str, float],
     config: BenchmarkConfig,
 ) -> None:
-    figure, axes = plt.subplots(1, 3, figsize=(19, 5.5))
+    figure, axes = plt.subplots(1, 5, figsize=(28, 5.5))
     floor = 1.0 / (config.sweep_bursts * (config.burst_len - config.window_len + 1))
     axes[0].axvspan(0, 4, color="tab:red", alpha=0.08, label="Low-SNR OOD")
     axes[0].axvspan(5, 20, color="tab:green", alpha=0.06, label="Training range")
@@ -912,57 +1022,81 @@ def _save_composite_figure(
 
     count = min(2500, len(constellation_inputs))
     sample = constellation_inputs[:count]
-    reconstructed = _reconstruct(autoencoder, sample, config.device)
-    raw_center = sample[:, :, 8]
-    denoised_center = reconstructed[:, :, 8]
-    axes[2].scatter(raw_center[:, 0], raw_center[:, 1], s=7, alpha=0.2, label="Raw impaired")
-    axes[2].scatter(denoised_center[:, 0], denoised_center[:, 1], s=7, alpha=0.3, label="DAE reconstruction")
-    axes[2].scatter([-1, 1], [0, 0], marker="x", s=70, color="black", label="Ideal BPSK")
-    axes[2].set(
-        title=f"12 dB constellation cleanup (EVM {evm['raw_percent']:.1f}% → {evm['dae_percent']:.1f}%)",
-        xlabel="In-phase (I)", ylabel="Quadrature (Q)",
+    dae_reconstruction = _reconstruct(dae, sample, config.device)
+    hybrid_reconstruction = _reconstruct(hybrid, sample, config.device)
+    _draw_constellation_panels(
+        axes[2:],
+        sample[:, :, 8],
+        dae_reconstruction[:, :, 8],
+        hybrid_reconstruction[:, :, 8],
+        evm,
     )
-    axes[2].axis("equal")
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend(fontsize=7)
-    figure.tight_layout()
+    figure.suptitle("12 dB constellation comparison", y=0.99)
+    figure.tight_layout(rect=(0, 0, 1, 0.94))
     figure.savefig("bpsk_composite_evaluation.png", dpi=180)
     plt.close(figure)
+
+
+def _draw_constellation_panels(
+    axes: NDArray,
+    raw_center: FloatArray,
+    dae_center: FloatArray,
+    hybrid_center: FloatArray,
+    evm: dict[str, float],
+) -> None:
+    panels = (
+        (raw_center, "Raw impaired input", evm["raw_percent"]),
+        (dae_center, "DenoisingAE1D", evm["dae_percent"]),
+        (hybrid_center, "DualDomainHybridAE", evm["hybrid_percent"]),
+    )
+    for axis, (points, title, evm_percent) in zip(axes, panels):
+        axis.scatter(points[:, 0], points[:, 1], s=7, alpha=0.25)
+        axis.scatter([-1, 1], [0, 0], marker="x", s=55, color="black")
+        axis.set(
+            title=f"{title}\n12 dB, EVM_RMS={evm_percent:.1f}%",
+            xlabel="In-phase (I)",
+            ylabel="Quadrature (Q)",
+        )
+        axis.axis("equal")
+        axis.grid(True, alpha=0.3)
 
 
 def _save_stress_figure(
     stress: dict[str, dict[str, object]],
     ablation: dict[str, dict[str, float]],
 ) -> None:
-    figure, axes = plt.subplots(2, 3, figsize=(18, 10))
-    for axis, (sweep_name, sweep) in zip(axes.flat[:5], stress.items()):
+    figure, axes = plt.subplots(3, 3, figsize=(19, 14))
+    for axis, (sweep_name, sweep) in zip(axes.flat[:len(stress)], stress.items()):
         x_values = sweep["values"]
         model_results = sweep["ber"]
         for model_name, values in model_results.items():
             axis.plot(x_values, values, marker="o", label=model_name)
         axis.set(title=sweep_name.replace("_", " "), xlabel=sweep["x_label"], ylabel="BER")
         axis.grid(True, alpha=0.3)
-    axes.flat[4].legend(fontsize=7)
+    axes.flat[0].legend(fontsize=6)
     cases = list(ablation)
     x = np.arange(len(cases))
     width = 0.8 / len(MODEL_FACTORIES)
+    ablation_axis = axes.flat[len(stress)]
     for index, model_name in enumerate(MODEL_FACTORIES):
-        axes.flat[5].bar(
+        ablation_axis.bar(
             x + index * width,
             [ablation[case][model_name] for case in cases],
             width,
             label=model_name,
         )
-    axes.flat[5].set(
+    ablation_axis.set(
         title="Leave-one-out impairment ablation",
         xlabel="Disabled impairment (or all active)",
         ylabel="BER at 15 dB",
         xticks=x + width * (len(MODEL_FACTORIES) - 1) / 2,
         xticklabels=cases,
     )
-    axes.flat[5].tick_params(axis="x", labelrotation=55)
-    axes.flat[5].grid(True, axis="y", alpha=0.3)
-    axes.flat[5].legend(fontsize=6)
+    ablation_axis.tick_params(axis="x", labelrotation=55)
+    ablation_axis.grid(True, axis="y", alpha=0.3)
+    ablation_axis.legend(fontsize=6)
+    for axis in axes.flat[len(stress) + 1:]:
+        axis.set_visible(False)
     figure.tight_layout()
     figure.savefig("bpsk_impairment_stress_sweeps.png", dpi=180)
     plt.close(figure)
@@ -1060,17 +1194,23 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
     if data_at_12 is None:
         raise RuntimeError("The configured SNR sweep must include 12 dB for EVM evaluation.")
     inputs_12, _, clean_12 = data_at_12
-    autoencoder = models["DenoisingAE1D"]
-    if not isinstance(autoencoder, DenoisingAE1D):
+    dae = models["DenoisingAE1D"]
+    hybrid = models["DualDomainHybridAE"]
+    if not isinstance(dae, DenoisingAE1D):
         raise TypeError("DenoisingAE1D factory returned an unexpected model type.")
-    reconstructed_12 = _reconstruct(autoencoder, inputs_12, config.device)
+    if not isinstance(hybrid, DualDomainHybridAE):
+        raise TypeError("DualDomainHybridAE factory returned an unexpected model type.")
+    dae_reconstructed_12 = _reconstruct(dae, inputs_12, config.device)
+    hybrid_reconstructed_12 = _reconstruct(hybrid, inputs_12, config.device)
     ideal_center = clean_12[:, :, config.window_len // 2]
     raw_center = inputs_12[:, :, config.window_len // 2]
-    reconstructed_center = reconstructed_12[:, :, config.window_len // 2]
+    dae_center = dae_reconstructed_12[:, :, config.window_len // 2]
+    hybrid_center = hybrid_reconstructed_12[:, :, config.window_len // 2]
     reference_power = float(np.sum(ideal_center**2)) + 1e-12
     evm = {
         "raw_percent": float(100.0 * math.sqrt(float(np.sum((raw_center - ideal_center) ** 2)) / reference_power)),
-        "dae_percent": float(100.0 * math.sqrt(float(np.sum((reconstructed_center - ideal_center) ** 2)) / reference_power)),
+        "dae_percent": float(100.0 * math.sqrt(float(np.sum((dae_center - ideal_center) ** 2)) / reference_power)),
+        "hybrid_percent": float(100.0 * math.sqrt(float(np.sum((hybrid_center - ideal_center) ** 2)) / reference_power)),
     }
 
     target_ber = (0.02, 0.01)
@@ -1090,6 +1230,7 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
 
     stress_specs: tuple[tuple[str, tuple[float, ...], str, str], ...] = (
         ("cfo", (0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03), "override_cfo", "Normalized CFO (cycles/symbol)"),
+        ("phase_noise_std", (0.0, 0.01, 0.025, 0.05, 0.075, 0.1), "override_phase_noise_std", "Phase increment std (rad/symbol)"),
         ("doppler", (0.001, 0.005, 0.01, 0.02, 0.035, 0.05), "override_doppler", "Normalized Doppler (fd Ts)"),
         ("sir_db", (0, 5, 10, 15, 20, 25), "override_sir_db", "SIR (dB)"),
         ("impulsive_probability", (0.0, 0.01, 0.025, 0.05, 0.075, 0.10), "override_imp_prob", "Spike probability"),
@@ -1150,6 +1291,22 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         str(snr): 0.5 * math.erfc(math.sqrt(10.0 ** (snr / 10.0)))
         for snr in config.snr_sweep_db
     }
+    ood_snrs = tuple(
+        snr for snr in config.snr_sweep_db
+        if snr < config.train_snr_db[0] or snr > config.train_snr_db[1]
+    )
+    ood_snr_results = {
+        name: {
+            str(snr): {
+                "ber": ber_results[name][str(snr)],
+                "fer": fer_results[name][str(snr)],
+                "accuracy": accuracy_results[name][str(snr)],
+                "roc_auc": auc_results[name][str(snr)],
+            }
+            for snr in ood_snrs
+        }
+        for name in MODEL_FACTORIES
+    }
     metrics: dict[str, object] = {
         "configuration": asdict(config),
         "windows_per_burst": config.burst_len - config.window_len + 1,
@@ -1158,6 +1315,8 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
         "fer_vs_snr": fer_results,
         "accuracy_vs_snr": accuracy_results,
         "roc_auc_vs_snr": auc_results,
+        "ood_snr_points_db": list(ood_snrs),
+        "ood_snr_results": ood_snr_results,
         "mean_accuracy_across_snr": {
             name: float(np.mean(list(values.values()))) for name, values in accuracy_results.items()
         },
@@ -1188,16 +1347,16 @@ def run_benchmark(config: BenchmarkConfig | None = None) -> dict[str, object]:
     }
     _save_composite_figure(
         ber_results, fer_results, config.snr_sweep_db, awgn_theory,
-        inputs_12, autoencoder, evm, config,
+        inputs_12, dae, hybrid, evm, config,
     )
     _save_stress_figure(stress_results, ablation_results)
-    _save_figure(ber_results, config.snr_sweep_db, inputs_12, autoencoder, config)
+    _save_figure(ber_results, config.snr_sweep_db, inputs_12, dae, hybrid, evm, config)
     _save_roc_figure(config.snr_sweep_db, auc_results, roc_at_12)
     _save_epoch_figure(training_history)
     with Path("benchmark_metrics.json").open("w", encoding="utf-8", newline="\n") as metrics_file:
         json.dump(metrics, metrics_file, indent=2)
         metrics_file.write("\n")
-    print("\nSaved benchmark_metrics.json and both evaluation figures.", flush=True)
+    print("\nSaved benchmark_metrics.json and evaluation figures.", flush=True)
     return metrics
 
 

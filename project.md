@@ -82,7 +82,7 @@ the SNR sweep. This prevents overlapping windows from the same burst leaking
 between training and validation. Training uses 1,000 bursts and validation
 uses 200. Each burst produces 51 overlapping 16-symbol windows.
 
-## The six models
+## The seven models
 
 - **MLP baseline:** A small fully connected network sees only the center I/Q
   pair. It is the point of comparison for using temporal context.
@@ -99,6 +99,14 @@ uses 200. Each burst produces 51 overlapping 16-symbol windows.
   and a decoder reconstructs a clean BPSK-shaped window. A small classifier
   then predicts the center bit from the reconstructed center I/Q sample.
   Its training loss combines bit-prediction loss with a reconstruction loss.
+- **DualDomainHybridAE (Dual-Domain Cartesian-Polar Hybrid Autoencoder):**
+  This proposed model denoises the I/Q samples in
+  Cartesian coordinates first, then converts the result to radius plus
+  cosine/sine phase features for a variational autoencoder. Think of cleaning
+  static and scratches off a photo first, then rotating and straightening the
+  tilted picture: the first stage can remove additive clutter, while the
+  second can learn a smoother representation of signal magnitude and phase.
+  The two stages are trained together with the bit classifier.
 
 The benchmark trains all models for 20 epochs with AdamW. The composite
 evaluation tests SNR values from 0 to 24 dB in 2 dB steps, using 150 bursts
@@ -113,21 +121,24 @@ python -m pip install torch numpy matplotlib
 python bpsk_cnn_benchmark.py
 ```
 
-The first run trains six models, so it can take a while, especially on a CPU.
+The first run trains seven models, so it can take a while, especially on a CPU.
 Trained weights and epoch history are saved under `checkpoints/`; later runs
 load those weights and run the evaluation suite without retraining. The script
 writes:
 
 - `benchmark_metrics.json` — parameter counts, measured inference latency,
-  configuration, BER/FER/accuracy/ROC AUC at each SNR, calibration loss,
-  SNR gains, EVM, stress sweeps, and ablation results;
+  configuration, BER/FER/accuracy/ROC AUC at each SNR, explicit OOD-SNR
+  results, calibration loss, SNR gains, EVM, stress sweeps, and ablation
+  results;
 - `bpsk_composite_evaluation.png` — BER with the theoretical AWGN reference,
-  FER, and the 12 dB constellation cleanup plot;
-- `bpsk_impairment_stress_sweeps.png` — the five fixed-15 dB stress sweeps and
+  FER, and a 12 dB three-panel constellation comparison with EVM on each
+  panel;
+- `bpsk_impairment_stress_sweeps.png` — the six fixed-15 dB stress sweeps and
   the leave-one-out ablation chart;
-- `bpsk_cnn_benchmark_results.png` — BER curves and the denoiser's I/Q
-  constellation comparison at 12 dB.
-- `bpsk_roc_auc_results.png` — ROC curves for all six models at 12 dB and
+- `bpsk_cnn_benchmark_results.png` — BER curves and a three-panel I/Q
+  constellation comparison at 12 dB (raw, DenoisingAE1D, and
+  DualDomainHybridAE, with EVM on each panel).
+- `bpsk_roc_auc_results.png` — ROC curves for all seven models at 12 dB and
   ROC AUC versus SNR;
 - `training_epoch_analysis.png` — validation accuracy and training loss
   across all 20 epochs for every model.
@@ -149,10 +160,11 @@ decision thresholds; 1.0 is perfect ranking, 0.5 is chance-level ranking.
 Because windows overlap, these are window-level measurements rather than
 independent-burst confidence intervals.
 
-On the **constellation plot**, each point is the center I/Q sample. Before
-denoising, the points are spread and distorted. After denoising, the
-autoencoder should tend to move them toward the two clean BPSK locations.
-This is a visual aid, not a substitute for the measured BER.
+On the **constellation plot**, each point is the center I/Q sample. Compare
+the raw input with the DenoisingAE1D and DualDomainHybridAE reconstructions;
+each panel reports RMS EVM against the ideal BPSK points. This is a visual
+aid, not a substitute for measured BER, and lower EVM does not necessarily
+mean lower BER.
 
 Latency is reported as the measured time to process 10,000 windows in batches
 of 256 on the machine and device used for that run. It is a software
@@ -160,37 +172,42 @@ benchmark, not a guarantee of real-time performance on a radio.
 
 ## What this benchmark run found
 
-In the recorded CPU run, DenoisingAE1D had the lowest BER at 20 dB
-(**0.0353**) and 24 dB (**0.0324**). ResNet1D was next-best at those points
-(**0.0818** and **0.0765**), while the center-sample MLP measured **0.1910**
-and **0.2067**. The DAE also had the highest mean accuracy (**90.82%**) and
-mean ROC AUC (**0.9551**) over the 13 SNR points; ResNet averaged **86.85%**
-accuracy and **0.9323** AUC. None of the models reached BER 0.02 or 0.01 by
-24 dB, so the script correctly reports the requested SNR gains as unavailable
-instead of extrapolating beyond observed data.
+In the recorded CPU run, DenoisingAE1D retained the lowest BER at 20 dB
+(**0.0353**) and 24 dB (**0.0324**); DualDomainHybridAE measured **0.0386**
+and **0.0376**, respectively. The hybrid did have the highest mean accuracy
+(**90.94%**) and mean ROC AUC (**0.9583**) across the 13 SNR points, slightly
+above the DAE (**90.82%**, **0.9551**). Its 24 dB FER was **0.44**, compared
+with **0.38** for the DAE. Neither it nor any other model reached BER 0.02 or
+0.01, so the requested SNR gains remain unavailable rather than extrapolated.
+The explicit OOD-SNR metrics cover 0, 2, 4, 22, and 24 dB; the hybrid's mean
+BER across those five points was **0.1306**, versus **0.1329** for the DAE.
 
-At 12 dB, DAE reconstruction reduced measured RMS EVM from **95.44%** on the
-raw input to **60.61%**. That is an improvement, but still leaves substantial
-distance from the ideal symbols. At 24 dB, the DAE's BER was **0.0324** but
-its FER was **0.38**: 38% of the 150 bursts still had at least one error
-among their 51 decisions.
+At 12 dB, RMS EVM was **95.44%** for the raw input, **60.61%** after DAE
+reconstruction, and **44.17%** after DualDomainHybridAE reconstruction.
+This is the hybrid's clearest measured advantage in this run, although its
+BER at 12 dB (**0.0600**) was essentially the same as the DAE's (**0.0599**).
+The CFO and phase-noise sweeps show mixed, not universal, gains: at the
+largest phase increment standard deviation (0.1 rad/symbol), hybrid BER was
+**0.0796** versus **0.0827** for the DAE, while at zero CFO it was **0.0425**
+versus **0.0399**. The polar bridge encodes phase continuously as cosine and
+sine; the model does not implement a separate phase-unwrapping algorithm.
 
-The MLP was the smallest and fastest model in this run: **641 parameters**,
-**2.50 KB** of FP32 weights, and about **7.69 ms per 10,000 windows**. The
-DAE used **13,061 parameters**, **51.02 KB**, and about **108.10 ms** per
-10,000 windows. In the 15 dB leave-one-out study, removing multipath caused
-the largest BER reduction for every model; for example, DAE BER changed from
-**0.0392** with all impairments to **0.0073** without multipath. This is a
-result of this synthetic setup and one randomized run, not a universal
-ranking of real-world channel problems.
+The MLP remained the smallest model: **641 parameters** and **2.50 KB** of
+FP32 weights. DualDomainHybridAE used **14,446 parameters**, **56.43 KB**,
+**159,536 MACs** per window, and about **281.04 ms per 10,000 windows** in
+this CPU run; DenoisingAE1D took about **107.75 ms**. These timings are
+machine-dependent. In the 15 dB leave-one-out study, removing multipath
+reduced hybrid BER from **0.0451** to **0.0047**. This is evidence from this
+synthetic setup and one randomized run, not a universal ranking of real-world
+channel problems.
 
 See
 [`training_epoch_analysis.png`](./training_epoch_analysis.png) and the
-epoch-by-epoch `training_history` in the metrics JSON for all six models.
+epoch-by-epoch `training_history` in the metrics JSON for all seven models.
 
 ## What every evaluation measures (plain-English guide)
 
-The evaluations reuse the same six already-trained models. Except when an
+The evaluations reuse the same seven already-trained models. Except when an
 ablation explicitly disables one effect, the ten impairment categories stay
 active together. SNR sets the thermal background-noise level; it does not turn
 the other distortions on or off. The stress tests hold thermal SNR at 15 dB
@@ -240,11 +257,12 @@ while deliberately changing one impairment parameter.
   reconstructed I/Q point with the ideal transmitted BPSK point and express
   the RMS distance as a percentage of ideal signal size. Picture darts
   scattered around two bullseyes: lower EVM means a tighter cluster. The
-  JSON gives raw-input and DAE-reconstruction values; EVM is not itself BER.
+  JSON gives raw-input, DAE-reconstruction, and hybrid-reconstruction values;
+  EVM is not itself BER.
 
 ### Stress sweeps and ablation study
 
-All five stress sweeps keep AWGN at 15 dB and leave the other impairment
+All six stress sweeps keep AWGN at 15 dB and leave the other impairment
 categories at their normal randomized settings. The horizontal axis changes
 one parameter at a time; each colored curve is one model. Higher BER means
 that condition is harder for that model.
@@ -252,6 +270,10 @@ that condition is harder for that model.
 - **CFO sweep:** Carrier-frequency offset is a mismatch between the radio
   clocks, causing the signal's angle to keep rotating. Larger normalized
   offsets imitate increasingly misaligned clocks.
+- **Phase-noise sweep:** This changes the standard deviation of each random
+  phase increment in the cumulative oscillator phase walk. Larger values
+  mean faster, less predictable phase variation; unlike CFO, the rotation
+  does not advance at one fixed rate.
 - **Doppler sweep:** Doppler measures how quickly the channel changes with
   motion. Larger normalized Doppler can represent faster relative movement,
   such as a vehicle passing through changing reflections.
