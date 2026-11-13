@@ -1,6 +1,8 @@
 # Seven-Model BPSK Equalizer Results
 
-This report combines the implemented model structures with the measurements saved in `benchmark_metrics.json`. The diagrams summarize the actual forward paths; result tables use all seven model values from the same seeded run. Metric values are formatted to nine decimal places where applicable.
+This report combines the implemented model structures with measurements saved in `benchmark_metrics.json`. The diagrams summarize the actual forward paths; metric values are formatted to nine decimal places where applicable.
+
+> **SNR reporting cutoff:** Every SNR-indexed table and plot in this report is filtered to 0-18 dB, inclusive. These are measurements from the saved run, not a new training or evaluation pass; the full metrics archive is unchanged.
 
 ## 1. Experiment and data framing
 
@@ -20,7 +22,7 @@ Each input is a per-window RMS-normalized \((B,2,16)\) I/Q sequence. The label i
     5.0,
     20.0
   ],
-  "snr_sweep_db": [
+  "reported_snr_points_db": [
     0,
     2,
     4,
@@ -30,10 +32,7 @@ Each input is a per-window RMS-normalized \((B,2,16)\) I/Q sequence. The label i
     12,
     14,
     16,
-    18,
-    20,
-    22,
-    24
+    18
   ],
   "sweep_bursts": 150,
   "stress_bursts": 150,
@@ -61,8 +60,8 @@ Each input is a per-window RMS-normalized \((B,2,16)\) I/Q sequence. The label i
 | Evaluation item | Value |
 | --- | --- |
 | Windows per burst | 51 |
-| SNR sweep (dB) | 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24 |
-| OOD SNR points (dB) | 0, 2, 4, 22, 24 |
+| Reported SNR points (dB) | 0, 2, 4, 6, 8, 10, 12, 14, 16, 18 |
+| Reported OOD SNR points (dB) | 0, 2, 4 |
 | Composite / stress / ablation bursts per condition | 150 / 150 / 150 |
 | Device | cpu |
 
@@ -199,23 +198,23 @@ The implemented bridge uses \(r=\sqrt{I_{cart}^2+Q_{cart}^2+10^{-6}}\), \(c=I_{c
 
 ## 4. Model-level summary
 
-Mean OOD BER is calculated as the arithmetic mean of the five stored OOD BER points. Other summary values below are stored directly in the JSON.
+Mean accuracy and ROC AUC are recalculated over the ten reported SNR points. Mean OOD BER uses the three reported OOD points (0, 2, and 4 dB); BCE @10 dB is from the saved JSON.
 
-| Model | Mean accuracy over SNR | Mean ROC AUC over SNR | BCE @10 dB | Mean OOD BER |
+| Model | Mean accuracy (0-18 dB) | Mean ROC AUC (0-18 dB) | BCE @10 dB | Mean OOD BER (0/2/4 dB) |
 | --- | --- | --- | --- | --- |
-| MLPBaseline | 0.786244344 | 0.870444409 | 0.432585202 | 0.228915033 |
-| VanillaCNN1D | 0.673464052 | 0.745477236 | 0.586127263 | 0.339241830 |
-| ResNet1D | 0.868486677 | 0.932263424 | 0.298939396 | 0.166745098 |
-| Inception1D | 0.732187029 | 0.822240031 | 0.520033170 | 0.283346405 |
-| DenseNet1D | 0.664957265 | 0.733348583 | 0.596186970 | 0.346274510 |
-| DenoisingAE1D | 0.908205128 | 0.955086350 | 0.188868604 | 0.132915033 |
-| DualDomainHybridAE | 0.909411765 | 0.958342254 | 0.188317311 | 0.130640523 |
+| MLPBaseline | 0.783071895 | 0.866110299 | 0.432585202 | 0.242004357 |
+| VanillaCNN1D | 0.669856209 | 0.740071045 | 0.586127263 | 0.354640523 |
+| ResNet1D | 0.852784314 | 0.920428358 | 0.298939396 | 0.226013072 |
+| Inception1D | 0.726379085 | 0.817074727 | 0.520033170 | 0.306623094 |
+| DenseNet1D | 0.660379085 | 0.728442005 | 0.596186970 | 0.362962963 |
+| DenoisingAE1D | 0.891241830 | 0.944137828 | 0.188868604 | 0.198039216 |
+| DualDomainHybridAE | 0.893960784 | 0.948521763 | 0.188317311 | 0.191503268 |
 
 ## 5. Composite SNR results
 
 ### 5.1 BER versus SNR
 
-All measured SNR points; values are evaluated on 150 generated bursts per point.
+Reported SNR points; values are evaluated on 150 generated bursts per point.
 
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D | DualDomainHybridAE |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -229,13 +228,10 @@ All measured SNR points; values are evaluated on 150 generated bursts per point.
 | 14 | 0.207320261 | 0.316209150 | 0.092679739 | 0.253856209 | 0.322745098 | 0.050196078 | 0.053594771 |
 | 16 | 0.193202614 | 0.312156863 | 0.082222222 | 0.247058824 | 0.322875817 | 0.036732026 | 0.036601307 |
 | 18 | 0.204052288 | 0.323921569 | 0.082352941 | 0.258823529 | 0.337124183 | 0.041699346 | 0.041307190 |
-| 20 | 0.190980392 | 0.311241830 | 0.081830065 | 0.248496732 | 0.316862745 | 0.035294118 | 0.038562092 |
-| 22 | 0.211895425 | 0.320784314 | 0.079215686 | 0.251241830 | 0.326405229 | 0.038039216 | 0.041045752 |
-| 24 | 0.206666667 | 0.311503268 | 0.076470588 | 0.245620915 | 0.316078431 | 0.032418301 | 0.037647059 |
 
 ### 5.2 Accuracy versus SNR
 
-All measured SNR points; values are evaluated on 150 generated bursts per point.
+Reported SNR points; values are evaluated on 150 generated bursts per point.
 
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D | DualDomainHybridAE |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -249,13 +245,10 @@ All measured SNR points; values are evaluated on 150 generated bursts per point.
 | 14 | 0.792679739 | 0.683790850 | 0.907320261 | 0.746143791 | 0.677254902 | 0.949803922 | 0.946405229 |
 | 16 | 0.806797386 | 0.687843137 | 0.917777778 | 0.752941176 | 0.677124183 | 0.963267974 | 0.963398693 |
 | 18 | 0.795947712 | 0.676078431 | 0.917647059 | 0.741176471 | 0.662875817 | 0.958300654 | 0.958692810 |
-| 20 | 0.809019608 | 0.688758170 | 0.918169935 | 0.751503268 | 0.683137255 | 0.964705882 | 0.961437908 |
-| 22 | 0.788104575 | 0.679215686 | 0.920784314 | 0.748758170 | 0.673594771 | 0.961960784 | 0.958954248 |
-| 24 | 0.793333333 | 0.688496732 | 0.923529412 | 0.754379085 | 0.683921569 | 0.967581699 | 0.962352941 |
 
 ### 5.3 ROC AUC versus SNR
 
-All measured SNR points; values are evaluated on 150 generated bursts per point.
+Reported SNR points; values are evaluated on 150 generated bursts per point.
 
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D | DualDomainHybridAE |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -269,13 +262,10 @@ All measured SNR points; values are evaluated on 150 generated bursts per point.
 | 14 | 0.875652360 | 0.759431627 | 0.964718234 | 0.839814017 | 0.749167835 | 0.988120316 | 0.987013315 |
 | 16 | 0.898274280 | 0.771811551 | 0.972581753 | 0.850821562 | 0.755512644 | 0.993425783 | 0.992564208 |
 | 18 | 0.884590125 | 0.752897159 | 0.969062175 | 0.835774353 | 0.735402286 | 0.989164388 | 0.988273738 |
-| 20 | 0.890607275 | 0.764662448 | 0.971304026 | 0.840270819 | 0.751451018 | 0.990524510 | 0.991315387 |
-| 22 | 0.880097159 | 0.758228211 | 0.971572331 | 0.837403777 | 0.744863702 | 0.991665316 | 0.991288020 |
-| 24 | 0.883969899 | 0.767602969 | 0.972264569 | 0.840698536 | 0.752796809 | 0.992554441 | 0.990628272 |
 
 ### 5.4 FER versus SNR
 
-All measured SNR points; values are evaluated on 150 generated bursts per point.
+Reported SNR points; values are evaluated on 150 generated bursts per point.
 
 | SNR (dB) | MLPBaseline | VanillaCNN1D | ResNet1D | Inception1D | DenseNet1D | DenoisingAE1D | DualDomainHybridAE |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -289,13 +279,10 @@ All measured SNR points; values are evaluated on 150 generated bursts per point.
 | 14 | 0.960000000 | 1.000000000 | 0.953333333 | 1.000000000 | 1.000000000 | 0.660000000 | 0.620000000 |
 | 16 | 0.940000000 | 1.000000000 | 0.920000000 | 1.000000000 | 1.000000000 | 0.493333333 | 0.526666667 |
 | 18 | 0.940000000 | 1.000000000 | 0.886666667 | 1.000000000 | 1.000000000 | 0.506666667 | 0.473333333 |
-| 20 | 0.920000000 | 1.000000000 | 0.926666667 | 1.000000000 | 1.000000000 | 0.480000000 | 0.513333333 |
-| 22 | 0.960000000 | 1.000000000 | 0.886666667 | 1.000000000 | 1.000000000 | 0.440000000 | 0.466666667 |
-| 24 | 0.953333333 | 1.000000000 | 0.906666667 | 1.000000000 | 1.000000000 | 0.380000000 | 0.440000000 |
 
 ## 6. Out-of-distribution SNR results
 
-Each table includes the five points outside the 5-20 dB training SNR interval. These values are also represented in the full composite SNR tables above.
+Each table includes only the reported OOD points below the 5-20 dB training SNR interval: 0, 2, and 4 dB. Higher-SNR OOD points are excluded from this report.
 
 ### OOD BER
 
@@ -304,8 +291,6 @@ Each table includes the five points outside the 5-20 dB training SNR interval. T
 | 0 | 0.274379085 | 0.361307190 | 0.260392157 | 0.322875817 | 0.372026144 | 0.242614379 | 0.235424837 |
 | 2 | 0.231241830 | 0.353594771 | 0.221960784 | 0.305751634 | 0.359346405 | 0.198039216 | 0.186666667 |
 | 4 | 0.220392157 | 0.349019608 | 0.195686275 | 0.291241830 | 0.357516340 | 0.153464052 | 0.152418301 |
-| 22 | 0.211895425 | 0.320784314 | 0.079215686 | 0.251241830 | 0.326405229 | 0.038039216 | 0.041045752 |
-| 24 | 0.206666667 | 0.311503268 | 0.076470588 | 0.245620915 | 0.316078431 | 0.032418301 | 0.037647059 |
 
 ### OOD FER
 
@@ -314,8 +299,6 @@ Each table includes the five points outside the 5-20 dB training SNR interval. T
 | 0 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 |
 | 2 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 |
 | 4 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 | 0.986666667 | 1.000000000 |
-| 22 | 0.960000000 | 1.000000000 | 0.886666667 | 1.000000000 | 1.000000000 | 0.440000000 | 0.466666667 |
-| 24 | 0.953333333 | 1.000000000 | 0.906666667 | 1.000000000 | 1.000000000 | 0.380000000 | 0.440000000 |
 
 ### OOD ACCURACY
 
@@ -324,8 +307,6 @@ Each table includes the five points outside the 5-20 dB training SNR interval. T
 | 0 | 0.725620915 | 0.638692810 | 0.739607843 | 0.677124183 | 0.627973856 | 0.757385621 | 0.764575163 |
 | 2 | 0.768758170 | 0.646405229 | 0.778039216 | 0.694248366 | 0.640653595 | 0.801960784 | 0.813333333 |
 | 4 | 0.779607843 | 0.650980392 | 0.804313725 | 0.708758170 | 0.642483660 | 0.846535948 | 0.847581699 |
-| 22 | 0.788104575 | 0.679215686 | 0.920784314 | 0.748758170 | 0.673594771 | 0.961960784 | 0.958954248 |
-| 24 | 0.793333333 | 0.688496732 | 0.923529412 | 0.754379085 | 0.683921569 | 0.967581699 | 0.962352941 |
 
 ### OOD ROC_AUC
 
@@ -334,12 +315,10 @@ Each table includes the five points outside the 5-20 dB training SNR interval. T
 | 0 | 0.800337848 | 0.694772904 | 0.814307179 | 0.758515704 | 0.687006947 | 0.825383124 | 0.840893883 |
 | 2 | 0.845294795 | 0.710296457 | 0.850394228 | 0.779903290 | 0.698449957 | 0.870194879 | 0.887512971 |
 | 4 | 0.860908567 | 0.717665015 | 0.884900363 | 0.797466233 | 0.708116356 | 0.916504081 | 0.923987276 |
-| 22 | 0.880097159 | 0.758228211 | 0.971572331 | 0.837403777 | 0.744863702 | 0.991665316 | 0.991288020 |
-| 24 | 0.883969899 | 0.767602969 | 0.972264569 | 0.840698536 | 0.752796809 | 0.992554441 | 0.990628272 |
 
-## 7. BER target SNR and high-SNR BER points
+## 7. BER target SNR and upper-end BER points
 
-`null` means a target BER was not reached on the measured curve; no extrapolated SNR is reported. The gain column is relative to MLPBaseline as stored in the JSON.
+`null` means a target BER was not reached on the reported curve; no extrapolated SNR is reported. The gain column is relative to MLPBaseline.
 
 | Model | Required SNR @ BER .02 (dB) | SNR gain vs MLP (dB) | Required SNR @ BER .01 (dB) | SNR gain vs MLP (dB) |
 | --- | --- | --- | --- | --- |
@@ -351,15 +330,15 @@ Each table includes the five points outside the 5-20 dB training SNR interval. T
 | DenoisingAE1D | null | null | null | null |
 | DualDomainHybridAE | null | null | null | null |
 
-| Model | BER @20 dB | BER @24 dB |
+| Model | BER @16 dB | BER @18 dB |
 | --- | --- | --- |
-| MLPBaseline | 0.190980392 | 0.206666667 |
-| VanillaCNN1D | 0.311241830 | 0.311503268 |
-| ResNet1D | 0.081830065 | 0.076470588 |
-| Inception1D | 0.248496732 | 0.245620915 |
-| DenseNet1D | 0.316862745 | 0.316078431 |
-| DenoisingAE1D | 0.035294118 | 0.032418301 |
-| DualDomainHybridAE | 0.038562092 | 0.037647059 |
+| MLPBaseline | 0.193202614 | 0.204052288 |
+| VanillaCNN1D | 0.312156863 | 0.323921569 |
+| ResNet1D | 0.082222222 | 0.082352941 |
+| Inception1D | 0.247058824 | 0.258823529 |
+| DenseNet1D | 0.322875817 | 0.337124183 |
+| DenoisingAE1D | 0.036732026 | 0.041699346 |
+| DualDomainHybridAE | 0.036601307 | 0.041307190 |
 
 ## 8. Theoretical BPSK AWGN reference
 
@@ -377,9 +356,6 @@ This is the theoretical AWGN-only reference and is not a learned-model result.
 | 14 | 0.000000000 |
 | 16 | 0.000000000 |
 | 18 | 0.000000000 |
-| 20 | 0.000000000 |
-| 22 | 0.000000000 |
-| 24 | 0.000000000 |
 
 ## 9. Center-symbol RMS EVM at 12 dB
 
@@ -577,10 +553,17 @@ All recorded epochs are included. Training loss objectives differ between classi
 
 ## 14. Generated evaluation figures
 
-- `bpsk_composite_evaluation.png`
+The SNR-axis figures below are regenerated using the 0-18 dB reported range.
+
+![Composite BER, FER, and constellation results through 18 dB](bpsk_composite_evaluation.png)
+
+![BER and constellation results through 18 dB](bpsk_cnn_benchmark_results.png)
+
+![ROC and ROC AUC results through 18 dB](bpsk_roc_auc_results.png)
+
+The impairment sweeps and training curves are not SNR-axis plots and remain unchanged:
+
 - `bpsk_impairment_stress_sweeps.png`
-- `bpsk_cnn_benchmark_results.png`
-- `bpsk_roc_auc_results.png`
 - `training_epoch_analysis.png`
 
 ## 15. Metric interpretation notes

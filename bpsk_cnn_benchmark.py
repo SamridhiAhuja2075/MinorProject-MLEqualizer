@@ -897,6 +897,8 @@ def _save_figure(
         ber = np.asarray([result[str(snr)] for snr in snrs])
         axes[0].semilogy(snrs, np.maximum(ber, ber_plot_floor), marker="o", label=name)
     axes[0].set(title="BER versus SNR", xlabel="SNR (dB)", ylabel="Bit error rate")
+    axes[0].set_xlim(min(snrs), max(snrs))
+    axes[0].set_xticks(snrs)
     axes[0].grid(True, which="both", alpha=0.3)
     axes[0].legend(fontsize=8)
 
@@ -954,6 +956,8 @@ def _save_roc_figure(
         xlabel="SNR (dB)",
         ylabel="ROC AUC",
         ylim=(0.0, 1.0),
+        xlim=(min(snrs), max(snrs)),
+        xticks=snrs,
     )
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(fontsize=8)
@@ -1002,21 +1006,59 @@ def _save_composite_figure(
 ) -> None:
     figure, axes = plt.subplots(1, 5, figsize=(28, 5.5))
     floor = 1.0 / (config.sweep_bursts * (config.burst_len - config.window_len + 1))
-    axes[0].axvspan(0, 4, color="tab:red", alpha=0.08, label="Low-SNR OOD")
-    axes[0].axvspan(5, 20, color="tab:green", alpha=0.06, label="Training range")
-    axes[0].axvspan(22, 24, color="tab:orange", alpha=0.08, label="High-SNR OOD")
+    snr_min, snr_max = min(snrs), max(snrs)
+    train_min, train_max = config.train_snr_db
+    low_ood_end = min(train_min, snr_max)
+    if snr_min < low_ood_end:
+        axes[0].axvspan(
+            snr_min, low_ood_end, color="tab:red", alpha=0.08, label="Low-SNR OOD"
+        )
+    train_start = max(snr_min, train_min)
+    train_end = min(snr_max, train_max)
+    if train_start < train_end:
+        axes[0].axvspan(
+            train_start, train_end, color="tab:green", alpha=0.06, label="Training range"
+        )
+    if snr_max > train_max:
+        axes[0].axvspan(
+            max(snr_min, train_max),
+            snr_max,
+            color="tab:orange",
+            alpha=0.08,
+            label="High-SNR OOD",
+        )
     for model_name, values in ber.items():
         axes[0].semilogy(
-            snrs, [max(values[str(snr)], floor) for snr in snrs], marker="o", label=model_name
+            snrs,
+            [max(values[str(snr)], floor) for snr in snrs],
+            marker="o",
+            label=model_name,
         )
-    axes[0].semilogy(snrs, [max(awgn_ber[str(snr)], floor) for snr in snrs], "k--", label="BPSK AWGN theory")
-    axes[0].set(title="BER versus SNR", xlabel="SNR (dB)", ylabel="BER")
+    axes[0].semilogy(
+        snrs,
+        [max(awgn_ber[str(snr)], floor) for snr in snrs],
+        "k--",
+        label="BPSK AWGN theory",
+    )
+    axes[0].set(
+        title="BER versus SNR",
+        xlabel="SNR (dB)",
+        ylabel="BER",
+        xlim=(snr_min, snr_max),
+        xticks=snrs,
+    )
     axes[0].grid(True, which="both", alpha=0.3)
     axes[0].legend(fontsize=7)
 
     for model_name, values in fer.items():
         axes[1].plot(snrs, [values[str(snr)] for snr in snrs], marker="o", label=model_name)
-    axes[1].set(title="Frame error rate (51 decisions)", xlabel="SNR (dB)", ylabel="FER")
+    axes[1].set(
+        title="Frame error rate (51 decisions)",
+        xlabel="SNR (dB)",
+        ylabel="FER",
+        xlim=(snr_min, snr_max),
+        xticks=snrs,
+    )
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(fontsize=7)
 
