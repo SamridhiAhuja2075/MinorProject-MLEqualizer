@@ -318,17 +318,9 @@ Each table includes only the reported OOD points below the 5-20 dB training SNR 
 
 ## 7. BER target SNR and upper-end BER points
 
-`null` means a target BER was not reached on the reported curve; no extrapolated SNR is reported. The gain column is relative to MLPBaseline.
 
-| Model | Required SNR @ BER .02 (dB) | SNR gain vs MLP (dB) | Required SNR @ BER .01 (dB) | SNR gain vs MLP (dB) |
-| --- | --- | --- | --- | --- |
-| MLPBaseline | null | null | null | null |
-| VanillaCNN1D | null | null | null | null |
-| ResNet1D | null | null | null | null |
-| Inception1D | null | null | null | null |
-| DenseNet1D | null | null | null | null |
-| DenoisingAE1D | null | null | null | null |
-| DualDomainHybridAE | null | null | null | null |
+
+
 
 | Model | BER @16 dB | BER @18 dB |
 | --- | --- | --- |
